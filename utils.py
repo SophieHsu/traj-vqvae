@@ -1,10 +1,11 @@
 import torch
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 import time
 import os
 from datasets.block import BlockDataset, LatentBlockDataset
+from load_traj import TrajectoryDataset, traj_data_loaders
 import numpy as np
 
 
@@ -57,9 +58,7 @@ def load_latent_block():
                        transform=None)
     return train, val
 
-
 def data_loaders(train_data, val_data, batch_size):
-
     train_loader = DataLoader(train_data,
                               batch_size=batch_size,
                               shuffle=True,
@@ -76,21 +75,44 @@ def load_data_and_data_loaders(dataset, batch_size):
         training_data, validation_data = load_cifar()
         training_loader, validation_loader = data_loaders(
             training_data, validation_data, batch_size)
-        x_train_var = np.var(training_data.train_data / 255.0)
+        # Updated: Use .data instead of .train_data
+        x_train_var = np.var(training_data.data / 255.0)
 
     elif dataset == 'BLOCK':
         training_data, validation_data = load_block()
         training_loader, validation_loader = data_loaders(
             training_data, validation_data, batch_size)
-
         x_train_var = np.var(training_data.data / 255.0)
+
     elif dataset == 'LATENT_BLOCK':
         training_data, validation_data = load_latent_block()
         training_loader, validation_loader = data_loaders(
             training_data, validation_data, batch_size)
-
         x_train_var = np.var(training_data.data)
 
+    elif dataset == 'MINIGRID':
+        data_file = "data/minigrid/nored-lrf-mapupdate-penalty0.005.hdf5"
+        full_dataset = TrajectoryDataset(data_file)
+        n_total = len(full_dataset)
+        n_val = int(n_total * 0.2)  # 20% for validation
+        n_train = n_total - n_val
+        print(f"Total trajectories: {n_total}, Training: {n_train}, Validation: {n_val}")
+
+        # Split the dataset into training and validation subsets
+        training_data, validation_data = random_split(full_dataset, [n_train, n_val])
+        
+        # Create DataLoaders for both subsets
+        training_loader, validation_loader = traj_data_loaders(training_data, validation_data, batch_size)
+        
+        # Compute the variance of the training states (using the "state0" data)
+        all_states = []
+        for traj in training_data:
+            all_states.append(traj["state0"])
+        if all_states:
+            all_states = np.concatenate(all_states, axis=0)
+            x_train_var = np.var(all_states)
+        else:
+            x_train_var = 0.0
     else:
         raise ValueError(
             'Invalid dataset: only CIFAR10 and BLOCK datasets are supported.')
@@ -105,7 +127,6 @@ def readable_timestamp():
 
 def save_model_and_results(model, results, hyperparameters, timestamp):
     SAVE_MODEL_PATH = os.getcwd() + '/results'
-
     results_to_save = {
         'model': model.state_dict(),
         'results': results,
@@ -113,3 +134,4 @@ def save_model_and_results(model, results, hyperparameters, timestamp):
     }
     torch.save(results_to_save,
                SAVE_MODEL_PATH + '/vqvae_data_' + timestamp + '.pth')
+
