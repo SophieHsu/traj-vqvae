@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from models.vqvae import VQVAE
+from models.vqvae import RNNVQVAE
 from utils import load_data_and_data_loaders, save_model_and_results, readable_timestamp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -28,12 +28,14 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             state1 = batch['state1'].to(device)
             action_indices = batch['action_indices'].to(device)
             reward = batch['reward'].to(device)
+            mask = batch["mask"].to(device)
             
             # Concatenate inputs
             x = torch.cat([state0, action_indices.unsqueeze(-1).float(), reward.unsqueeze(-1)], dim=-1)
 
             # Forward pass
-            embedding_loss, x_hat, perplexity = model(x)
+            # embedding_loss, x_hat, perplexity = model({"traj": x, "mask": mask})
+            model({"traj": x, "mask": mask})
             
             # Compute reconstruction loss with state1 as target
             recon_loss = nn.MSELoss()(x_hat, x.reshape(x.shape[0], 1, -1))
@@ -243,9 +245,12 @@ def plot_tsne(z_qs, agent_labels, savefile):
 
 def main():
     # Hyperparameters
-    h_dim = 128
-    # h_dim = 32
+    in_dim = 88 # per-timestep feature dimension (len(obs + action + reward))
+    # h_dim = 128
+    h_dim = 64
     res_h_dim = 32
+    n_rnn_layers = 1
+    bidirectional = True
     # res_h_dim = 16
     n_res_layers = 1
     n_embeddings = 6
@@ -266,7 +271,8 @@ def main():
         dataset='MINIGRID', batch_size=batch_size)
 
     # Initialize model
-    model = VQVAE(h_dim, res_h_dim, n_res_layers, n_embeddings, embedding_dim, beta).to(device)
+    # model = RNNVQVAE(in_dim, h_dim, res_h_dim, n_res_layers, n_embeddings, embedding_dim, beta).to(device)
+    model = RNNVQVAE(in_dim, h_dim, n_embeddings, bidirectional, beta).to(device)
     
     # Train model
     print("Starting training...")

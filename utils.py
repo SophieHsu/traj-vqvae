@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader, random_split
 import time
 import os
 from datasets.block import BlockDataset, LatentBlockDataset
-from load_traj import TrajectoryDataset, traj_data_loaders
+from load_traj import TrajectoryDataset, MultiAgentTrajectoryDataset, traj_data_loaders, multiagent_traj_data_loaders
 import numpy as np
 
 
@@ -91,8 +91,10 @@ def load_data_and_data_loaders(dataset, batch_size):
         x_train_var = np.var(training_data.data)
 
     elif dataset == 'MINIGRID':
-        data_file = "data/minigrid/nored-lrf-mapupdate-penalty0.005.hdf5"
-        full_dataset = TrajectoryDataset(data_file)
+        # data_file = "data/minigrid/nored-lrf-mapupdate-penalty0.005.hdf5"
+        data_file = "data/minigrid/4-rooms-1k/combined.hdf5"
+        # full_dataset = TrajectoryDataset(data_file)
+        full_dataset = MultiAgentTrajectoryDataset(data_file)
         n_total = len(full_dataset)
         n_val = int(n_total * 0.2)  # 20% for validation
         n_train = n_total - n_val
@@ -102,7 +104,8 @@ def load_data_and_data_loaders(dataset, batch_size):
         training_data, validation_data = random_split(full_dataset, [n_train, n_val])
         
         # Create DataLoaders for both subsets
-        training_loader, validation_loader = traj_data_loaders(training_data, validation_data, batch_size)
+        # training_loader, validation_loader = traj_data_loaders(training_data, validation_data, batch_size)
+        training_loader, validation_loader = multiagent_traj_data_loaders(training_data, validation_data, batch_size)
         
         # Compute the variance of the training states (using the "state0" data)
         all_states = []

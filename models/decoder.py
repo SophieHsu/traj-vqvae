@@ -8,7 +8,7 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.residual import ResidualStack
+from models.residual import ResidualStack, LinearResidualStack
 
 
 class Decoder(nn.Module):
@@ -42,6 +42,25 @@ class Decoder(nn.Module):
 
     def forward(self, x):
         return self.inverse_conv_stack(x)
+
+class LinearDecoder(nn.Module):
+    """
+    Custom linear version of Decoder class
+    """
+    def __init__(self, in_dim, h_dim, n_res_layers, res_h_dim):
+        super(LinearDecoder, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(in_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, h_dim // 2),
+            nn.ReLU(),
+            nn.Linear(h_dim // 2, 1),
+            LinearResidualStack(h_dim // 2, h_dim // 2, res_h_dim, n_res_layers),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
 
 
 if __name__ == "__main__":

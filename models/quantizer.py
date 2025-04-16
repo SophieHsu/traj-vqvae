@@ -17,11 +17,12 @@ class VectorQuantizer(nn.Module):
     - beta : commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
     """
 
-    def __init__(self, n_e, e_dim, beta):
+    def __init__(self, n_e, e_dim, beta, encoder_type):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
         self.beta = beta
+        self.encoder_type = encoder_type
 
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
@@ -42,8 +43,14 @@ class VectorQuantizer(nn.Module):
 
         """
         # reshape z -> (batch, height, width, channel) and flatten
-        z = z.permute(0, 2, 1).contiguous()
-        z_flattened = z.view(-1, self.e_dim)
+        if self.encoder_type == "conv":
+            # this encoder type outputs z_e with dimension (B, e_dim, C)
+            z = z.permute(0, 2, 1).contiguous() # (B, e_dim, C) -> (B, C, e_dim)
+            z_flattened = z.view(-1, self.e_dim)
+        elif self.encoder_type == "rnn":
+            z_flattened = z
+        else:
+            raise NotImplementedError("encoder_type other than conv and rnn are not supported")
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
 
         d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
@@ -71,6 +78,8 @@ class VectorQuantizer(nn.Module):
         perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
 
         # reshape back to match original input shape
-        z_q = z_q.permute(0, 2, 1).contiguous()
-
+        if self.encoder_type == "conv":
+            z_q = z_q.permute(0, 2, 1).contiguous()
+        
         return loss, z_q, perplexity, min_encodings, min_encoding_indices
+
