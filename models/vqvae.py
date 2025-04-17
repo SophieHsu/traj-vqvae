@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from models.encoder import Encoder, RNNEncoder
 from models.quantizer import VectorQuantizer
-from models.decoder import Decoder
+from models.decoder import Decoder, TransformerActionPredictor
 
 
 class VQVAE(nn.Module):
@@ -51,13 +52,18 @@ class VQVAE(nn.Module):
    
 class RNNVQVAE(nn.Module):
     def __init__(
-        self, in_dim, h_dim, 
-        # num_layers, bidirectional,
-        # res_h_dim, n_res_layers,
+        self, in_dim, state_dim,
+        h_dim, 
         n_embeddings, bidirectional, 
-        beta, save_img_embedding_map=False,
+        beta,
+        n_actions, n_steps,
+        decoder_context_dim,
+        n_attention_heads,
+        n_decoder_layers,
+        save_img_embedding_map=False,
     ):
         super().__init__()
+        self.n_actions = n_actions
         # encode image into continuous latent space
         self.encoder = RNNEncoder(in_dim=in_dim, h_dim=h_dim, num_layers=1, bidirectional=True)
         # self.pre_quantization_conv = nn.Conv1d(
@@ -66,8 +72,17 @@ class RNNVQVAE(nn.Module):
         embedding_dim = h_dim * 2 if bidirectional else h_dim
         self.vector_quantization = VectorQuantizer(
             n_embeddings, embedding_dim, beta, encoder_type="rnn")
-        # # decode the discrete latent representation
+        # decode the discrete latent representation
         # self.decoder = Decoder(embedding_dim, h_dim, n_res_layers, res_h_dim)
+        self.decoder = TransformerActionPredictor(
+            embedding_dim=embedding_dim, # dimension of z_q
+            state_dim=state_dim, # input state dimension (s, a, r)
+            num_actions=n_actions,
+            n_steps=n_steps,
+            d_model=decoder_context_dim,
+            nhead=n_attention_heads,
+            num_layers=n_decoder_layers,
+        )
 
         if save_img_embedding_map:
             self.img_to_embedding_map = {i: [] for i in range(n_embeddings)}
@@ -77,31 +92,39 @@ class RNNVQVAE(nn.Module):
     def forward(self, x, verbose=False):
         """
         x = {
-            "traj" : [B, T, d_feature],
+            "traj" : [B, T, d_feature], # train data
+            "future_traj" : [B, T_max, d_feature] # rest of trajectory after "traj"
             "mask" : [B, T],
+            "future_mask: :
         }
         """
         traj = x["traj"]
+        next_state = x["next_state"]
+        future_actions = x["future_actions"]
         mask = x["mask"]
+        future_mask = x["future_mask"]
 
         # get embedding corresponding to the last non-masked timestep for each trajectory
         z_e = self.encoder(traj)
         last_real_index = mask.shape[1] - 1 - torch.argmax(torch.flip(mask, dims=[1]), axis=1)
         z_e = z_e[torch.arange(z_e.shape[0]), last_real_index]
 
-        # z_e = self.pre_quantization_conv(z_e)
-        # print("pre quantization conv output shape", z_e.shape)
+        # pass through VQ layer
         embedding_loss, z_q, perplexity, _, _ = self.vector_quantization(z_e)
-        breakpoint()
-        # print("zq shape", z_q.shape)
-        # x_hat = self.decoder(z_q)
+        
+        # predict future
+        target_actions = future_actions[:,:self.decoder.n_steps]
+        logits = self.decoder(z_q, next_state, target_actions)
 
-        # if verbose:
-        #     print('original data shape:', x.shape)
-        #     print('encoded data shape:', z_e.shape)
-        #     print('recon data shape:', x_hat.shape)
-        #     assert False
+        # compute CE loss - TODO START HERE
+        future_mask = future_mask[:,:self.decoder.n_steps]
+        masked_targets = target_actions.clone() # masking padded timesteps
+        masked_targets[future_mask == 0] = -100  # index to ignore
 
-        # return embedding_loss, x_hat, perplexity
-        return z_e
+        pred_loss = F.cross_entropy(
+            logits.view(-1, self.n_actions),
+            target_actions.reshape(-1),
+            ignore_index=-100,
+        )
+        return logits, embedding_loss, pred_loss
    

@@ -60,11 +60,10 @@ def mutliagent_traj_collate_fn(batch):
     """
     Custom collate function for use with MultiAgentTrajectoryDataset
     """
-    state0 = []
-    state1 = []
-    action_indices = []
-    reward = []
-    mask = []
+    state0, state1, future_state = [], [], []
+    action_indices, future_action_indices = [], []
+    reward, future_reward = [], []
+    mask, future_mask = [], []
     agent_id = []
 
     for traj in batch:
@@ -73,6 +72,10 @@ def mutliagent_traj_collate_fn(batch):
         action_indices.append(traj["action_indices"])
         reward.append(traj["reward"])
         mask.append(traj["mask"])
+        future_state.append(traj["future_state"])
+        future_action_indices.append(traj["future_action_indices"])
+        future_reward.append(traj["future_reward"])
+        future_mask.append(traj["future_mask"])
         agent_id.append(traj["attributes"]["agent_id"])
     
     return {
@@ -81,6 +84,10 @@ def mutliagent_traj_collate_fn(batch):
         "action_indices": torch.tensor(np.stack(action_indices), dtype=torch.long),
         "reward": torch.tensor(np.stack(reward), dtype=torch.float32),
         "mask": torch.tensor(np.stack(mask), dtype=torch.long),
+        "future_state": torch.tensor(np.stack(future_state), dtype=torch.float32),
+        "future_action_indices": torch.tensor(np.stack(future_action_indices), dtype=torch.long),
+        "future_reward": torch.tensor(np.stack(future_reward), dtype=torch.float32),
+        "future_mask": torch.tensor(np.stack(future_mask), dtype=torch.long),
         "agent_id": torch.tensor(np.stack(agent_id), dtype=torch.long),
     }
 
@@ -175,6 +182,10 @@ class MultiAgentTrajectoryDataset(Dataset):
         
         with h5py.File(data_file_path, "r") as data_file:
             traj_group = data_file["trajectories"]
+            # get max trajectory length
+            max_traj_len = max([traj_group[traj_name].attrs["episode_len"] for traj_name in traj_group.keys()])
+            max_future_traj_len = max_traj_len - self.sequence_len
+
             for traj_name in traj_group.keys():
                 grp = traj_group[traj_name]
                 traj_len = grp.attrs["episode_len"]
@@ -203,7 +214,6 @@ class MultiAgentTrajectoryDataset(Dataset):
                     # relabel actions for padded timesteps with "done" action (assume that agent stays at the goal after reaching it)
                     relabeled_action_indices = np.pad(action_indices, pad_width=(0,pad_len), mode="constant") # pad with zeros
                     relabeled_action_indices[sequence_len-pad_len:] = action_mapping["done"] # relabel with "done" action
-
                     # relabel padded timesteps as 
                     self.trajectories.append({
                         "state0": np.pad(state0, pad_width=pad_width, mode=pad_mode),
@@ -213,12 +223,21 @@ class MultiAgentTrajectoryDataset(Dataset):
                         "action_names": np.pad(action_names, pad_width=(0,pad_len), mode=pad_mode),
                         "reward": np.pad(reward, pad_width=(0,pad_len), mode=pad_mode),
                         "mask": mask, # 1 if real data, 0 if padded data
+                        "future_state": np.zeros((max_future_traj_len, state0.shape[1])), # there are no future state information
+                        "future_action_indices": np.zeros(max_future_traj_len),
+                        "future_reward": np.zeros(max_future_traj_len),
+                        "future_mask": np.zeros(max_future_traj_len),
                         "attributes": attributes,
                         "traj_name": traj_name,
                     })
                 else:
                     # use sliding window to generate samples
                     for i in range(0, traj_len-self.sequence_len+1, self.stride):
+                        future_traj_len = traj_len - (i + self.sequence_len) 
+                        pad_len = max_future_traj_len - future_traj_len # how many future steps to pad
+                        pad_width = ((0, pad_len), (0, 0))
+                        future_mask = np.zeros(max_future_traj_len)
+                        future_mask[:future_traj_len] = 1
                         self.trajectories.append({
                             "state0": state0[i:i+self.sequence_len],
                             "state1": state1[i:i+self.sequence_len],
@@ -226,10 +245,13 @@ class MultiAgentTrajectoryDataset(Dataset):
                             "action_names": action_names[i:i+self.sequence_len],
                             "reward": reward[i:i+self.sequence_len],
                             "mask": np.ones(self.sequence_len), # 1 if real data, 0 if padded data
+                            "future_state": np.pad(state0[i+self.sequence_len:], pad_width=pad_width),
+                            "future_action_indices": np.pad(action_indices[i+self.sequence_len:], pad_width=(0,pad_len)),
+                            "future_reward": np.pad(reward[i+self.sequence_len:], pad_width=(0,pad_len)),
+                            "future_mask": future_mask,
                             "attributes": attributes,
                             "traj_name": traj_name,
-                        })
-        
+                        })   
         print("Action mapping:")
         for action, idx in action_mapping.items():
             print(f"  {idx}: {action}")

@@ -29,19 +29,25 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             action_indices = batch['action_indices'].to(device)
             reward = batch['reward'].to(device)
             mask = batch["mask"].to(device)
-            
+            future_state = batch["future_state"].to(device)
+            future_action_indices = batch["future_action_indices"].to(device)
+            # future_rewards  = batch["future_reward"].to(device)
+            future_mask = batch["future_mask"].to(device)
+
             # Concatenate inputs
             x = torch.cat([state0, action_indices.unsqueeze(-1).float(), reward.unsqueeze(-1)], dim=-1)
-
-            # Forward pass
-            # embedding_loss, x_hat, perplexity = model({"traj": x, "mask": mask})
-            model({"traj": x, "mask": mask})
             
-            # Compute reconstruction loss with state1 as target
-            recon_loss = nn.MSELoss()(x_hat, x.reshape(x.shape[0], 1, -1))
+            # Forward pass
+            logits, embedding_loss, pred_loss = model({
+                "traj": x, # past trajectory
+                "next_state": future_state[:,0,:], # current state
+                "future_actions" : future_action_indices,  
+                "mask": mask,
+                "future_mask": future_mask,
+            })
             
             # Total loss
-            loss = recon_loss + embedding_loss
+            loss = pred_loss + embedding_loss
             
             # Backward pass
             optimizer.zero_grad()
@@ -55,17 +61,30 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
         total_val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
+                # Move data to device
                 state0 = batch['state0'].to(device)
                 state1 = batch['state1'].to(device)
                 action_indices = batch['action_indices'].to(device)
                 reward = batch['reward'].to(device)
-                
+                mask = batch["mask"].to(device)
+                future_state = batch["future_state"].to(device)
+                future_action_indices = batch["future_action_indices"].to(device)
+                # future_rewards  = batch["future_reward"].to(device)
+                future_mask = batch["future_mask"].to(device)
+
                 # Concatenate inputs
                 x = torch.cat([state0, action_indices.unsqueeze(-1).float(), reward.unsqueeze(-1)], dim=-1)
                 
-                embedding_loss, x_hat, perplexity = model(x)
-                recon_loss = nn.MSELoss()(x_hat, x.reshape(x.shape[0], 1, -1))
-                loss = recon_loss + embedding_loss
+                # Forward pass
+                logits, embedding_loss, pred_loss = model({
+                    "traj": x, # past trajectory
+                    "next_state": future_state[:,0,:], # current state
+                    "future_actions" : future_action_indices,  
+                    "mask": mask,
+                    "future_mask": future_mask,
+                })
+                
+                loss = pred_loss + embedding_loss
                 
                 total_val_loss += loss.item()
         
@@ -75,10 +94,12 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
         
-        print(f'Epoch [{epoch+1}/{num_epochs}], '
-              f'Train Loss: {avg_train_loss:.4f}, '
-              f'Val Loss: {avg_val_loss:.4f}, '
-              f'Perplexity: {perplexity:.4f}')
+        print(
+            f'Epoch [{epoch+1}/{num_epochs}], '
+            f'Train Loss: {avg_train_loss:.4f}, '
+            f'Val Loss: {avg_val_loss:.4f}, '
+            # f'Perplexity: {perplexity:.4f}'
+        )
     
     return train_losses, val_losses
 
@@ -244,23 +265,29 @@ def plot_tsne(z_qs, agent_labels, savefile):
     plt.savefig(savefile)
 
 def main():
-    # Hyperparameters
+    ####### Hyperparameters #######    
+    """Encoder Settings"""
     in_dim = 88 # per-timestep feature dimension (len(obs + action + reward))
-    # h_dim = 128
     h_dim = 64
-    res_h_dim = 32
-    n_rnn_layers = 1
     bidirectional = True
-    # res_h_dim = 16
     n_res_layers = 1
     n_embeddings = 6
     embedding_dim = 64
-    # embedding_dim = 16
+    """Decoder Settings"""
+    state_dim = 86 # dimension of state the decoder sees as input
+    n_actions = 3 # number of discrete actions
+    n_steps = 10
+    decoder_context_dim = 128
+    n_attention_heads = 4
+    n_decoder_layers = 2
+    """Training Settings"""
     beta = 0.25
     num_epochs = 100
     batch_size = 32
     learning_rate = 1e-4
-    
+    ####### Hyperparameters #######    
+
+
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -271,9 +298,20 @@ def main():
         dataset='MINIGRID', batch_size=batch_size)
 
     # Initialize model
-    # model = RNNVQVAE(in_dim, h_dim, res_h_dim, n_res_layers, n_embeddings, embedding_dim, beta).to(device)
-    model = RNNVQVAE(in_dim, h_dim, n_embeddings, bidirectional, beta).to(device)
-    
+    model = RNNVQVAE(
+        in_dim=in_dim,
+        state_dim=state_dim,
+        h_dim=h_dim,
+        n_embeddings=n_embeddings,
+        bidirectional=bidirectional,
+        beta=beta,
+        n_actions=n_actions,
+        n_steps=n_steps,
+        decoder_context_dim=decoder_context_dim,
+        n_attention_heads=n_attention_heads,
+        n_decoder_layers=n_decoder_layers,
+    ).to(device)
+
     # Train model
     print("Starting training...")
     train_losses, val_losses = train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, device)
@@ -289,7 +327,6 @@ def main():
     }
     hyperparameters = {
         'h_dim': h_dim,
-        'res_h_dim': res_h_dim,
         'n_res_layers': n_res_layers,
         'n_embeddings': n_embeddings,
         'embedding_dim': embedding_dim,
