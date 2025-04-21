@@ -10,7 +10,45 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.residual import ResidualStack, LinearResidualStack
 
-class TransformerActionPredictor(nn.Module):
+class MultiCodeTransformerActionPredictor(nn.Module):
+    def __init__(
+        self, embedding_dim, state_dim, num_actions, n_steps,
+        d_model=128, nhead=4, num_layers=3
+    ):
+        super().__init__()
+        self.n_steps = n_steps
+        self.state_proj = nn.Linear(state_dim, d_model)
+        self.code_proj = nn.Linear(embedding_dim, d_model)
+
+        decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+
+        self.token_embed = nn.Embedding(num_actions, d_model)
+        self.action_out = nn.Linear(d_model, num_actions)
+
+    def forward(self, z_q, current_state, target_actions=None):
+        """
+        z_q: [B, k, D] – VQ latents
+        current_state: [B, state_dim]
+        target_actions: [B, T_out] – optional for teacher forcing
+        """
+        B = z_q.shape[0]
+        memory = self.code_proj(z_q)  # [B, k, d_model]
+
+        state_embed = self.state_proj(current_state).unsqueeze(1)  # [B, 1, d_model]
+        memory = torch.cat([state_embed, memory], dim=1)  # [B, k+1, d_model]
+
+        if target_actions is not None:
+            tgt = self.token_embed(target_actions)  # [B, T_out, d_model]
+        else:
+            tgt = torch.zeros(B, self.n_steps, memory.size(-1), device=memory.device)
+
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.n_steps).to(memory.device)
+        output = self.decoder(tgt=tgt, memory=memory, tgt_mask=tgt_mask)  # [B, T_out, d_model]
+        return self.action_out(output)  # [B, T_out, num_actions]
+
+
+class TrajLevelTransformerActionPredictor(nn.Module):
     def __init__(self, embedding_dim, state_dim, num_actions, n_steps, d_model=128, nhead=4, num_layers=2):
         """
         Transformer to predict future agent actions from knowledge embedding and current state
@@ -72,6 +110,121 @@ class TransformerActionPredictor(nn.Module):
 
         logits = self.output_proj(output)  # (B, T, num_actions)
         return logits
+
+
+class TransformerActionPredictor(nn.Module):
+    def __init__(self, embedding_dim, state_dim, num_actions, n_steps,
+                 d_model, nhead, num_layers):
+        super().__init__()
+        self.n_steps = n_steps
+        self.num_actions = num_actions
+
+        self.state_proj = nn.Linear(state_dim, d_model)
+        self.token_embedding = nn.Embedding(num_actions, d_model)
+        self.pos_embedding = nn.Parameter(torch.randn(n_steps+1, d_model)) # +1 since starting with next-sate token
+
+        self.transformer = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(d_model, nhead),
+            num_layers=num_layers
+        )
+
+        self.latent_proj = nn.Linear(embedding_dim, d_model)
+        self.out = nn.Linear(d_model, num_actions)
+
+    def forward(self, z_q, state, target_actions=None):
+        """
+        z_q: [B, T_latent, D]
+        state: [B, state_dim]
+        target_actions: [B, n_steps] (optional, used for teacher forcing)
+        """
+        B = z_q.shape[0]
+
+        # encode memory from discrete latents
+        memory = self.latent_proj(z_q).transpose(0, 1)  # [T_latent, B, d_model]
+
+        # project state
+        state_embed = self.state_proj(state).unsqueeze(1)  # [B, 1, d_model]
+
+        if target_actions is not None:
+            tokens = self.token_embedding(target_actions)  # [B, n_steps, d_model]
+            tokens = torch.cat([state_embed, tokens[:, :-1]], dim=1)  # shift right
+        else:
+            tokens = state_embed  # inference: start with state
+
+        tokens += self.pos_embedding[:tokens.size(1)].unsqueeze(0)  # add pos embedding
+        tokens = tokens.transpose(0, 1)  # [n_steps, B, d_model]
+
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.n_steps).to(tokens.device)
+
+        out = self.transformer(tgt=tokens, memory=memory, tgt_mask=tgt_mask)
+        logits = self.out(out.transpose(0, 1))  # [B, n_steps, num_actions]
+        # logits = self.out(out.transpose(0, 1))[:, 1:]  # discard state part of sequence?
+
+        return logits
+    
+# class TransformerActionPredictor(nn.Module):
+#     def __init__(self, embedding_dim, state_dim, num_actions, n_steps, d_model=128, nhead=4, num_layers=2):
+#         """
+#         Transformer to predict future agent actions from knowledge embedding and current state
+
+#         Args:
+#             embedding_dim : dimension of VQ layer output z_q
+#             state_dim : size of state (per timestep) the action predictor sees (does not include action and reward components)
+#             num_actions : number of possible discrete actions
+#             n_steps : number of future steps to predict
+#             d_model : input gets projected into a context of this size
+#             nhead : number of attention heads in multi-head attention
+#             num_layers :
+#         """
+#         super().__init__()
+#         self.n_steps = n_steps
+#         self.num_actions = num_actions
+
+#         self.latent_project = nn.Linear(embedding_dim + state_dim, d_model) # project z_q and current state to context
+#         self.action_embed = nn.Embedding(num_actions + 1, d_model)  # +1 for start token
+#         self.pos_embed = nn.Parameter(torch.randn(n_steps, d_model)) # learnable positional embeddings
+
+#         decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=nhead, batch_first=True) 
+#         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers) 
+
+#         self.output_proj = nn.Linear(d_model, num_actions) # output projection head
+
+#     def forward(self, latent, state, target_actions=None):
+#         """
+#         latent: (B, D)
+#         state: (B, S)
+#         target_actions: (B, T) or None (for autoregressive inference)
+
+#         Returns:
+#             logits: (B, T, num_actions)
+#         """
+#         B = latent.size(0)
+#         T = self.n_steps
+
+#         # Encode conditioning context
+#         context = torch.cat([latent, state], dim=-1)  # (B, D + S)
+#         context = self.latent_project(context).unsqueeze(1)  # (B, 1, d_model)
+
+#         # Prepare target action sequence with start token
+#         if target_actions is not None:
+#             tgt = torch.cat([
+#                 torch.full((B, 1), self.num_actions, dtype=torch.long, device=latent.device),  # start token
+#                 target_actions[:, :-1]  # shift targets right
+#             ], dim=1)
+#         else:
+#             tgt = torch.full((B, T), self.num_actions, dtype=torch.long, device=latent.device)  # start tokens
+
+#         tgt_emb = self.action_embed(tgt) + self.pos_embed.unsqueeze(0)  # (B, T, d_model)
+
+#         # Generate causal mask
+#         tgt_mask = nn.Transformer.generate_square_subsequent_mask(T).to(latent.device)  # (T, T)
+
+#         # Transformer decoder
+#         output = self.transformer(tgt_emb, context, tgt_mask=tgt_mask)  # (B, T, d_model)
+
+#         logits = self.output_proj(output)  # (B, T, num_actions)
+#         return logits
+
 
 class Decoder(nn.Module):
     """

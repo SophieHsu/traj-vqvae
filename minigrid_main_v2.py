@@ -17,11 +17,25 @@ from sklearn.manifold import TSNE
 def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, device):
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     train_losses = []
+    train_emb_losses = []
+    train_pred_losses = []
+    train_accuracy = []
     val_losses = []
+    val_emb_losses = []
+    val_pred_losses = []
+    val_accuracy = []
+    
     
     for epoch in range(num_epochs):
         model.train()
+
+        # keep track of taining losses
         total_train_loss = 0
+        total_emb_trian_loss = 0
+        total_pred_train_loss = 0
+        n_correct_train = 0
+        n_pred_train = 0 # number of valid predictions (gt action exists)
+
         for batch in train_loader:
             # Move data to device
             state0 = batch['state0'].to(device)
@@ -55,10 +69,27 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             optimizer.step()
             
             total_train_loss += loss.item()
+            total_emb_trian_loss += embedding_loss.item()
+            total_pred_train_loss += pred_loss.item()
+
+            # record accuracy
+            future_mask = future_mask[:,:logits.shape[1]]
+            predicted_actions = logits.argmax(axis=-1)
+            gt_actions = future_action_indices[:,:logits.shape[1]]
+            gt_actions[future_mask == 0] = -100
+            n_correct_train += (predicted_actions == gt_actions).sum().item()
+            n_pred_train += future_mask.sum().item()
         
         # Validation
         model.eval()
+
+        # keep track of validation losses
         total_val_loss = 0
+        total_emb_val_loss = 0
+        total_pred_val_loss = 0
+        n_correct_val = 0
+        n_pred_val = 0 # number of valid predictions (gt action exists)
+
         with torch.no_grad():
             for batch in val_loader:
                 # Move data to device
@@ -87,21 +118,51 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                 loss = pred_loss + embedding_loss
                 
                 total_val_loss += loss.item()
+                total_emb_val_loss += embedding_loss.item()
+                total_pred_val_loss += pred_loss.item()
         
+                # record accuracy
+                future_mask = future_mask[:,:logits.shape[1]]
+                predicted_actions = logits.argmax(axis=-1)
+                gt_actions = future_action_indices[:,:logits.shape[1]]
+                gt_actions[future_mask == 0] = -100
+                n_correct_val += (predicted_actions == gt_actions).sum().item()
+                n_pred_val += future_mask.sum().item()
+
         avg_train_loss = total_train_loss / len(train_loader)
+        avg_emb_train_loss = total_emb_trian_loss / len(train_loader)
+        avg_pred_train_loss = total_pred_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
+        avg_emb_val_loss = total_emb_val_loss / len(val_loader)
+        avg_pred_val_loss = total_pred_val_loss / len(val_loader)
+        avg_pred_train_accuracy = n_correct_train / n_pred_train
+        avg_pred_val_accuracy = n_correct_val / n_pred_val
         
         train_losses.append(avg_train_loss)
+        train_emb_losses.append(avg_emb_train_loss)
+        train_pred_losses.append(avg_pred_train_loss)
+        train_accuracy.append(avg_pred_train_accuracy)
         val_losses.append(avg_val_loss)
-        
+        val_emb_losses.append(avg_emb_val_loss)
+        val_pred_losses.append(avg_pred_val_loss)
+        val_accuracy.append(avg_pred_val_accuracy)
+
         print(
             f'Epoch [{epoch+1}/{num_epochs}], '
             f'Train Loss: {avg_train_loss:.4f}, '
+            f'Train Loss (embedding): {avg_emb_train_loss:.4f}, '
+            f'Train Loss (prediction): {avg_pred_train_loss:.4f}, '
+            f'Train Accuracy: {avg_pred_train_accuracy:.4f}, '
+            
             f'Val Loss: {avg_val_loss:.4f}, '
+            f'Val Loss (embedding): {avg_emb_val_loss:.4f}, '
+            f'Val Loss (prediction): {avg_pred_val_loss:.4f}, '
+            f'Val Accuracy: {avg_pred_val_accuracy:.4f}, '
             # f'Perplexity: {perplexity:.4f}'
         )
     
-    return train_losses, val_losses
+    return (train_losses, train_emb_losses, train_pred_losses, train_accuracy,
+        val_losses, val_emb_losses, val_pred_losses, val_accuracy)
 
 def eval_vqvae(model, train_loader, val_loader, device):
 
@@ -128,22 +189,30 @@ def eval_vqvae(model, train_loader, val_loader, device):
             state1 = batch['state1'].to(device)
             action_indices = batch['action_indices'].to(device)
             reward = batch['reward'].to(device)
+            mask = batch["mask"].to(device)
+            future_state = batch["future_state"].to(device)
+            future_action_indices = batch["future_action_indices"].to(device)
+            future_mask = batch["future_mask"].to(device)
             agent_id = batch["agent_id"]
-            
+
             # Concatenate inputs
             x = torch.cat([state0, action_indices.unsqueeze(-1).float(), reward.unsqueeze(-1)], dim=-1)
+            
+            # Get embeddings
+            z_e, z_q, min_encodings, min_encoding_indices = model.get_embeddings({
+                "traj": x,
+                "mask": mask,
+            })        
 
-            # Encode
-            z_e = model.encoder(x.reshape(x.shape[0], 1, -1))
-            z_e = model.pre_quantization_conv(z_e)
-            _, z_q, _, min_encodings, min_encoding_indices = model.vector_quantization(z_e)
+            # Get codebook usage per agent
             agent_ids[split].append(agent_id)
-            min_encoding_indices = min_encoding_indices.cpu().view(z_e.shape[0], z_e.shape[2])
+            min_encoding_indices = min_encoding_indices.cpu()
+            # min_encoding_indices = min_encoding_indices.cpu().view(z_e.shape[0], z_e.shape[2])
             # traj_emb_ind = scipy.stats.mode(min_encoding_indices, axis=1)[0]
             # traj_encoding_indices[split].append(traj_emb_ind)
             z_qs[split].append(z_q.detach().cpu().numpy())
             traj_encoding_indices[split].append(min_encoding_indices)
-
+    
         agent_ids[split] = torch.cat(agent_ids[split]).numpy()
         traj_encoding_indices[split] = np.vstack(traj_encoding_indices[split])
         z_qs[split] = np.vstack(z_qs[split])
@@ -255,10 +324,6 @@ def plot_tsne(z_qs, agent_labels, savefile):
             color=agent_to_color[agent], 
             label=f"Agent {agent}",
         )
-    # for i, (x, y) in enumerate(z_tsne):
-    #     breakpoint()
-    #     agent = agent_labels[i]
-    #     plt.scatter(x, y, color=agent_to_color[agent], label=f"Agent {agent}" if agent not in plt.gca().get_legend_handles_labels()[1] else "")
     plt.title("Trajectory-level z_q Embeddings (Flattened)")
     plt.legend()
     plt.tight_layout()
@@ -287,7 +352,6 @@ def main():
     learning_rate = 1e-4
     ####### Hyperparameters #######    
 
-
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -314,15 +378,20 @@ def main():
 
     # Train model
     print("Starting training...")
-    train_losses, val_losses = train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, device)
-
+    train_losses, train_emb_losses, train_pred_losses, train_accuracy, \
+        val_losses, val_emb_losses, val_pred_losses, val_accuracy \
+            = train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, device)
     eval_vqvae(model, train_loader, val_loader, device)
 
     # Save results
     timestamp = readable_timestamp()
     results = {
         'train_losses': train_losses,
+        'train_emb_losses': train_emb_losses, 
+        'train_pred_losses': train_pred_losses, 
         'val_losses': val_losses,
+        'val_emb_losses': val_emb_losses, 
+        'val_pred_losses':val_pred_losses,
         'x_train_var': x_train_var
     }
     hyperparameters = {
@@ -345,7 +414,38 @@ def main():
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-    plt.savefig(f'results/loss_plot_{timestamp}.png')
+    plt.savefig(f'results/loss_plot.png')
+    plt.clf()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_emb_losses, label='Training Loss')
+    plt.plot(val_emb_losses, label='Validation Loss')
+    plt.title('Training and Validation Losses (Embedding)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig(f'results/emb_loss_plot.png')
+    plt.clf()
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_pred_losses, label='Training Loss')
+    plt.plot(val_pred_losses, label='Validation Loss')
+    plt.title('Training and Validation Losses (Embedding)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig(f'results/pred_loss_plot.png')
+    plt.clf()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_accuracy, label='Training')
+    plt.plot(val_accuracy, label='Validation')
+    plt.title('Training and Validation Accuracies')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig(f'results/accuracy_plot.png')
+    plt.clf()
     plt.close()
 
 if __name__ == "__main__":
