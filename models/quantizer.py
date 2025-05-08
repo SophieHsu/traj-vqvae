@@ -83,7 +83,7 @@ class VectorQuantizer(nn.Module):
         if self.encoder_type == "conv":
             # this encoder type outputs z_e with dimension (B, e_dim, C)
             z = z.permute(0, 2, 1).contiguous() # (B, e_dim, C) -> (B, C, e_dim)
-            z_flattened = z.view(-1, self.e_dim)
+            z_flattened = z.reshape(-1, self.e_dim)
         elif self.encoder_type == "trajrnn":
             z_flattened = z
         elif self.encoder_type == "timernn":
@@ -99,7 +99,7 @@ class VectorQuantizer(nn.Module):
         # find closest encodings
         min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
         min_encodings = torch.zeros(
-            min_encoding_indices.shape[0], self.n_e).to(device)
+            min_encoding_indices.shape[0], self.n_e).to(z.device)
         min_encodings.scatter_(1, min_encoding_indices, 1)
 
         # get quantized latent vectors

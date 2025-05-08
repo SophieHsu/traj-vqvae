@@ -112,7 +112,10 @@ class TrajLevelTransformerActionPredictor(nn.Module):
         return logits
 
 
-class TransformerActionPredictor(nn.Module):
+class TransformerFutureActionPredictor(nn.Module):
+    """
+    Predicts future n actions given z_q
+    """
     def __init__(self, embedding_dim, state_dim, num_actions, n_steps,
                  d_model, nhead, num_layers):
         super().__init__()
@@ -162,6 +165,127 @@ class TransformerActionPredictor(nn.Module):
 
         return logits
     
+class TransformerActionPredictor(nn.Module):
+    """
+    Predicts past (all timesteps used as input) and future n steps of actions given z_q
+    """
+    def __init__(
+        self, embedding_dim, 
+        state_dim, num_actions, n_future_steps, n_past_steps,
+        d_model, nhead, num_layers
+    ):
+        """
+        n_past_steps (int) : number of steps passed in as input to the encoder
+        """
+        super().__init__()
+        self.n_future_steps = n_future_steps
+        self.n_past_steps = n_past_steps
+        self.num_actions = num_actions
+
+        self.state_proj = nn.Linear(state_dim, d_model)
+
+        self.pad_token_id = num_actions # special token for padded actions (assuming action indices are 0~num_actions-1)
+        self.token_embedding = nn.Embedding(num_actions+1, d_model, padding_idx=self.pad_token_id)
+
+        n_prediction_steps = self.n_future_steps + self.n_past_steps
+        self.pos_embedding = nn.Parameter(torch.randn(n_prediction_steps + 1, d_model))  # +1 for state token
+
+        self.transformer = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(d_model, nhead),
+            num_layers=num_layers
+        )
+
+        self.latent_proj = nn.Linear(embedding_dim, d_model)
+        self.out = nn.Linear(d_model, num_actions)
+
+    def forward(self, z_q, state, target_actions=None):
+        """
+        z_q: [B, T_latent, D]
+        state: [B, state_dim]
+        target_actions: [B, n_steps] (optional, used for teacher forcing)
+        """
+        n_total_steps = target_actions.size(1) if target_actions is not None else self.n_future_steps + self.n_past_steps
+
+        B = z_q.shape[0]
+
+        # encode memory from discrete latents
+        memory = self.latent_proj(z_q).transpose(0, 1)  # [T_latent, B, d_model]
+
+        # project state
+        state_embed = self.state_proj(state).unsqueeze(1)  # [B, 1, d_model]
+        if target_actions is not None:
+            # replace -100 with padding token ID so padded actions are not embedded
+            target_actions = target_actions.clone()
+            target_actions[target_actions == -100] = self.pad_token_id
+            tgt_key_padding_mask = (target_actions == self.pad_token_id)  # Mask padding tokens
+
+            tokens = self.token_embedding(target_actions)  # [B, T, d_model]
+            tokens = torch.cat([state_embed, tokens[:, :-1]], dim=1)  # shift right
+        else:
+            tokens = state_embed
+            tgt_key_padding_mask = torch.zeros(B, 1, dtype=torch.bool).to(tokens.device)  # No padding for input tokens
+
+        tokens += self.pos_embedding[:tokens.size(1)].unsqueeze(0) # add pos embedding
+        tokens = tokens.transpose(0, 1)  # [n_steps, B, d_model]
+
+        # tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.n_steps).to(tokens.device)
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(tokens.size(0)).to(tokens.device)
+
+        # out = self.transformer(tgt=tokens, memory=memory, tgt_mask=tgt_mask)
+        out = self.transformer(tgt=tokens, memory=memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
+
+        logits = self.out(out.transpose(0, 1))  # [B, n_steps, num_actions]
+        # logits = self.out(out.transpose(0, 1))[:, 1:]  # discard state part of sequence?
+
+        return logits
+    
+    @torch.no_grad()
+    def autoregressive_decode(self, z_q, state, n_past_steps, n_future_steps):
+        """
+        Autoregressively generate actions given z_q and current state.
+        
+        z_q: [B, T_latent, D]
+        state: [B, state_dim]
+        max_len: total number of steps to generate (n_past + n_future)
+
+        Returns:
+            predicted_actions: [B, max_len] (int tokens)
+        """
+        max_len = n_past_steps + n_future_steps
+        B = z_q.shape[0]
+        device = z_q.device
+
+        # encode memory
+        memory = self.latent_proj(z_q).transpose(0, 1)  # [T_latent, B, d_model]
+
+        # fixed context
+        state_embed = self.state_proj(state).unsqueeze(1)  # [B, 1, d_model]
+
+        # initialize sequence with state_embed
+        generated_tokens = []
+        input_tokens = state_embed  # shape [B, 1, d_model]
+
+        for step in range(max_len):
+            # add positional embedding
+            tokens = input_tokens + self.pos_embedding[:input_tokens.size(1)].unsqueeze(0)
+            tokens = tokens.transpose(0, 1)
+
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(tokens.size(0)).to(device)
+            out = self.transformer(tgt=tokens, memory=memory, tgt_mask=tgt_mask)
+            logits = self.out(out[-1])  # take only last token's output: shape [B, num_actions]
+
+            predicted_action = torch.argmax(logits, dim=-1)  # [B]
+
+            generated_tokens.append(predicted_action)
+
+            # Embed and append predicted action
+            next_token = self.token_embedding(predicted_action).unsqueeze(1)  # [B, 1, D]
+            input_tokens = torch.cat([input_tokens, next_token], dim=1)
+
+        return torch.stack(generated_tokens, dim=1)  # [B, max_len]
+
+
+
 # class TransformerActionPredictor(nn.Module):
 #     def __init__(self, embedding_dim, state_dim, num_actions, n_steps, d_model=128, nhead=4, num_layers=2):
 #         """

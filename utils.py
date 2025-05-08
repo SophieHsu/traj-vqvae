@@ -70,7 +70,7 @@ def data_loaders(train_data, val_data, batch_size):
     return train_loader, val_loader
 
 
-def load_data_and_data_loaders(dataset, batch_size):
+def load_data_and_data_loaders(dataset, batch_size, **kwargs):
     if dataset == 'CIFAR10':
         training_data, validation_data = load_cifar()
         training_loader, validation_loader = data_loaders(
@@ -94,7 +94,7 @@ def load_data_and_data_loaders(dataset, batch_size):
         # data_file = "data/minigrid/nored-lrf-mapupdate-penalty0.005.hdf5"
         data_file = "data/minigrid/4-rooms-1k/combined.hdf5"
         # full_dataset = TrajectoryDataset(data_file)
-        full_dataset = MultiAgentTrajectoryDataset(data_file)
+        full_dataset = MultiAgentTrajectoryDataset(data_file, **kwargs)
         n_total = len(full_dataset)
         n_val = int(n_total * 0.2)  # 20% for validation
         n_train = n_total - n_val

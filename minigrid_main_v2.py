@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from models.vqvae import RNNVQVAE
+from models.vqvae import RNNVQVAE, RNNFutureVQVAE, PredictionTypes
 from utils import load_data_and_data_loaders, save_model_and_results, readable_timestamp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,7 +12,7 @@ import seaborn as sns
 from collections import defaultdict
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-
+import argparse
 
 def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, device):
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -20,10 +20,12 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
     train_emb_losses = []
     train_pred_losses = []
     train_accuracy = []
+    train_n_pred = []
     val_losses = []
     val_emb_losses = []
     val_pred_losses = []
     val_accuracy = []
+    val_n_pred = []
     
     
     for epoch in range(num_epochs):
@@ -55,11 +57,12 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             logits, embedding_loss, pred_loss = model({
                 "traj": x, # past trajectory
                 "next_state": future_state[:,0,:], # current state
-                "future_actions" : future_action_indices,  
+                "actions": action_indices,
+                "future_actions": future_action_indices,  
                 "mask": mask,
                 "future_mask": future_mask,
             })
-            
+
             # Total loss
             loss = pred_loss + embedding_loss
             
@@ -73,13 +76,20 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             total_pred_train_loss += pred_loss.item()
 
             # record accuracy
-            future_mask = future_mask[:,:logits.shape[1]]
             predicted_actions = logits.argmax(axis=-1)
-            gt_actions = future_action_indices[:,:logits.shape[1]]
-            gt_actions[future_mask == 0] = -100
+            if model.prediction_type == PredictionTypes.FUTURE:
+                gt_mask = future_mask[:,:logits.shape[1]]
+                gt_actions = future_action_indices[:,:logits.shape[1]]
+                gt_actions[gt_mask == 0] = -100
+            elif model.prediction_type == PredictionTypes.PAST_FUTURE:
+                assert action_indices.shape[1] == model.n_past_steps, "make sure n_past_steps and the number of actions in the trajectory matches"
+                gt_actions = torch.cat((action_indices, future_action_indices[:,:model.n_future_steps]), dim=1)
+                gt_mask = torch.cat((mask, future_mask[:,:model.n_future_steps]), dim=1)
+                gt_actions[gt_mask == 0] = -100
             n_correct_train += (predicted_actions == gt_actions).sum().item()
-            n_pred_train += future_mask.sum().item()
-        
+            n_pred_train += gt_mask.sum().item()
+            train_n_pred.append(n_pred_train)
+
         # Validation
         model.eval()
 
@@ -110,6 +120,7 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                 logits, embedding_loss, pred_loss = model({
                     "traj": x, # past trajectory
                     "next_state": future_state[:,0,:], # current state
+                    "actions": action_indices,
                     "future_actions" : future_action_indices,  
                     "mask": mask,
                     "future_mask": future_mask,
@@ -121,13 +132,30 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                 total_emb_val_loss += embedding_loss.item()
                 total_pred_val_loss += pred_loss.item()
         
+                # # record accuracy
+                # future_mask = future_mask[:,:logits.shape[1]]
+                # predicted_actions = logits.argmax(axis=-1)
+                # gt_actions = future_action_indices[:,:logits.shape[1]]
+                # gt_actions[future_mask == 0] = -100
+                # n_correct_val += (predicted_actions == gt_actions).sum().item()
+                # n_pred_val += future_mask.sum().item()
+
                 # record accuracy
-                future_mask = future_mask[:,:logits.shape[1]]
                 predicted_actions = logits.argmax(axis=-1)
-                gt_actions = future_action_indices[:,:logits.shape[1]]
-                gt_actions[future_mask == 0] = -100
+                if model.prediction_type == PredictionTypes.FUTURE:
+                    gt_mask = future_mask[:,:logits.shape[1]]
+                    gt_actions = future_action_indices[:,:logits.shape[1]]
+                    gt_actions[gt_mask == 0] = -100
+                elif model.prediction_type == PredictionTypes.PAST_FUTURE:
+                    assert action_indices.shape[1] == model.n_past_steps, "make sure n_past_steps and the number of actions in the trajectory matches"
+                    gt_actions = torch.cat((action_indices, future_action_indices[:,:model.n_future_steps]), dim=1)
+                    gt_mask = torch.cat((mask, future_mask[:,:model.n_future_steps]), dim=1)
+                    gt_actions[gt_mask == 0] = -100
                 n_correct_val += (predicted_actions == gt_actions).sum().item()
-                n_pred_val += future_mask.sum().item()
+                n_pred_val += gt_mask.sum().item()
+                val_n_pred.append(n_pred_val)
+
+                # TODO - run autoregressive inference 
 
         avg_train_loss = total_train_loss / len(train_loader)
         avg_emb_train_loss = total_emb_trian_loss / len(train_loader)
@@ -161,10 +189,10 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             # f'Perplexity: {perplexity:.4f}'
         )
     
-    return (train_losses, train_emb_losses, train_pred_losses, train_accuracy,
-        val_losses, val_emb_losses, val_pred_losses, val_accuracy)
+    return (train_losses, train_emb_losses, train_pred_losses, train_accuracy, train_n_pred,
+        val_losses, val_emb_losses, val_pred_losses, val_accuracy, val_n_pred)
 
-def eval_vqvae(model, train_loader, val_loader, device):
+def eval_vqvae(model, train_loader, val_loader, save_dir, device):
 
     model.eval()
 
@@ -223,18 +251,19 @@ def eval_vqvae(model, train_loader, val_loader, device):
             token_ids=traj_encoding_indices[split], 
             agent_labels=agent_ids[split],
             n_embeddings=n_embs,
-            savefile=f"codebook_use_{split}.png"
+            savefile=os.path.join(save_dir, f"codebook_use_{split}.png")
         )
         plot_codebook_usage_heatmap(
             token_ids=traj_encoding_indices[split], 
             agent_labels=agent_ids[split], 
             n_embeddings=n_embs,
-            savefile=f"codebook_heatmap_{split}.png",
+            savefile=os.path.join(save_dir, f"codebook_heatmap_{split}.png"),
         )
         plot_tsne(
             z_qs=z_qs[split],
             agent_labels=agent_ids[split],
-            savefile=f"zq_tsne_{split}.png",
+            # savefile=os.path.join(save_dir, f"zq_tsne_{split}.png"),
+            savename=os.path.join(save_dir, f"zq_tsne_{split}"),
         )
 
     # count the number of times each agent's trajectory maps to each embedding id
@@ -302,7 +331,7 @@ def plot_codebook_usage_heatmap(token_ids, agent_labels, n_embeddings, savefile)
     plt.savefig(savefile)
     plt.clf()
 
-def plot_tsne(z_qs, agent_labels, savefile):
+def plot_tsne(z_qs, agent_labels, savename):
     z_qs_flattened = np.transpose(z_qs, (0, 2, 1)).reshape(z_qs.shape[0], -1) # flatten 
     
     # reduce dimensionality with PCA
@@ -317,6 +346,7 @@ def plot_tsne(z_qs, agent_labels, savefile):
 
     plt.figure(figsize=(8, 6))
     for agent in unique_agents:
+        save_file = f"{savename}_{agent}.png"
         inds = np.where(agent_labels == agent)[0]
         tsne_latents = z_tsne[inds]
         plt.scatter(
@@ -324,13 +354,15 @@ def plot_tsne(z_qs, agent_labels, savefile):
             color=agent_to_color[agent], 
             label=f"Agent {agent}",
         )
-    plt.title("Trajectory-level z_q Embeddings (Flattened)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(savefile)
+        plt.title(f"Trajectory-level z_q Embeddings (Flattened) {agent}")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(save_file)
 
-def main():
+def main(args):
     ####### Hyperparameters #######    
+    """Dataset Settings"""
+    input_seq_len = 30 # number of past steps to feed into encoder
     """Encoder Settings"""
     in_dim = 88 # per-timestep feature dimension (len(obs + action + reward))
     h_dim = 64
@@ -341,16 +373,20 @@ def main():
     """Decoder Settings"""
     state_dim = 86 # dimension of state the decoder sees as input
     n_actions = 3 # number of discrete actions
-    n_steps = 10
+    n_future_steps = 10
     decoder_context_dim = 128
     n_attention_heads = 4
     n_decoder_layers = 2
     """Training Settings"""
     beta = 0.25
-    num_epochs = 100
+    num_epochs = 200
     batch_size = 32
     learning_rate = 1e-4
     ####### Hyperparameters #######    
+
+    # make directory to save result plots
+    save_dir = os.path.join("results", args.plot_dir)
+    os.makedirs(save_dir, exist_ok=True)
 
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -359,7 +395,7 @@ def main():
     # Load data
     print("Loading data...")
     training_data, validation_data, train_loader, val_loader, x_train_var = load_data_and_data_loaders(
-        dataset='MINIGRID', batch_size=batch_size)
+        dataset='MINIGRID', batch_size=batch_size, sequence_len=input_seq_len)
 
     # Initialize model
     model = RNNVQVAE(
@@ -370,18 +406,32 @@ def main():
         bidirectional=bidirectional,
         beta=beta,
         n_actions=n_actions,
-        n_steps=n_steps,
+        n_future_steps=n_future_steps,  
+        n_past_steps=input_seq_len, 
         decoder_context_dim=decoder_context_dim,
         n_attention_heads=n_attention_heads,
         n_decoder_layers=n_decoder_layers,
     ).to(device)
+    # model = RNNFutureVQVAE(
+    #     in_dim=in_dim,
+    #     state_dim=state_dim,
+    #     h_dim=h_dim,
+    #     n_embeddings=n_embeddings,
+    #     bidirectional=bidirectional,
+    #     beta=beta,
+    #     n_actions=n_actions,
+    #     n_steps=n_future_steps,
+    #     decoder_context_dim=decoder_context_dim,
+    #     n_attention_heads=n_attention_heads,
+    #     n_decoder_layers=n_decoder_layers,
+    # ).to(device)
 
     # Train model
     print("Starting training...")
-    train_losses, train_emb_losses, train_pred_losses, train_accuracy, \
-        val_losses, val_emb_losses, val_pred_losses, val_accuracy \
+    train_losses, train_emb_losses, train_pred_losses, train_accuracy, train_n_pred, \
+        val_losses, val_emb_losses, val_pred_losses, val_accuracy, val_n_pred \
             = train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, device)
-    eval_vqvae(model, train_loader, val_loader, device)
+    eval_vqvae(model, train_loader, val_loader, save_dir, device)
 
     # Save results
     timestamp = readable_timestamp()
@@ -414,7 +464,7 @@ def main():
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-    plt.savefig(f'results/loss_plot.png')
+    plt.savefig(os.path.join(save_dir, "loss_plot.png"))
     plt.clf()
 
     plt.figure(figsize=(10, 5))
@@ -424,17 +474,17 @@ def main():
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-    plt.savefig(f'results/emb_loss_plot.png')
+    plt.savefig(os.path.join(save_dir, "emb_loss_plot.png"))
     plt.clf()
     
     plt.figure(figsize=(10, 5))
     plt.plot(train_pred_losses, label='Training Loss')
     plt.plot(val_pred_losses, label='Validation Loss')
-    plt.title('Training and Validation Losses (Embedding)')
+    plt.title('Training and Validation Losses (CE)')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-    plt.savefig(f'results/pred_loss_plot.png')
+    plt.savefig(os.path.join(save_dir, 'pred_loss_plot.png'))
     plt.clf()
 
     plt.figure(figsize=(10, 5))
@@ -444,9 +494,24 @@ def main():
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-    plt.savefig(f'results/accuracy_plot.png')
+    plt.savefig(os.path.join(save_dir, 'accuracy_plot.png'))
     plt.clf()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_n_pred, label="Training")
+    plt.plot(val_n_pred, label="Validation")
+    plt.title('Number of valid action predictions')
+    plt.xlabel('Epoch')
+    plt.ylabel('N valid predictions')
+    plt.legend()
+    plt.savefig(os.path.join(save_dir, 'n_valid_predictions.png'))
+    plt.clf()
+
     plt.close()
 
 if __name__ == "__main__":
-    main() 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plot-dir", type=str, help="directory to save result plots to")
+    args = parser.parse_args()
+
+    main(args) 

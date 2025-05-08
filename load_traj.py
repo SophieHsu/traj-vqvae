@@ -107,8 +107,9 @@ class MultiAgentTrajectoryDataset(Dataset):
 
                     # relabel actions for padded timesteps with "done" action (assume that agent stays at the goal after reaching it)
                     relabeled_action_indices = np.pad(action_indices, pad_width=(0,pad_len), mode="constant") # pad with zeros
-                    relabeled_action_indices[sequence_len-pad_len:] = action_mapping["done"] # relabel with "done" action
-                    # relabel padded timesteps as 
+                    # relabeled_action_indices[sequence_len-pad_len:] = action_mapping["done"] # relabel with "done" action
+                    relabeled_action_indices[sequence_len-pad_len:] = -100 # pad with -100, indicating these actions should be ignored
+
                     self.trajectories.append({
                         "state0": np.pad(state0, pad_width=pad_width, mode=pad_mode),
                         "state1": np.pad(state1, pad_width=pad_width),
