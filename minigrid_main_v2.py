@@ -2,33 +2,54 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+
 from models.vqvae import RNNVQVAE, RNNFutureVQVAE, PredictionTypes
 from utils import load_data_and_data_loaders, save_model_and_results, readable_timestamp
+
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 import scipy
 import seaborn as sns
 from collections import defaultdict
+
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+
 import argparse
+import wandb
+import tyro
+import time
+import random
+from tqdm import tqdm
+
+from dataclasses import dataclass
 
 def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, device):
+
+    # setup wandb logging
+    run_name = f"{args.exp_name}_{args.seed}_{int(time.time())}"
+    if args.track:
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=run_name,
+            save_code=True,
+        )
+        if wandb.run is not None:
+            wandb.run.log_code(".")
+
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    train_losses = []
-    train_emb_losses = []
-    train_pred_losses = []
-    train_accuracy = []
-    train_n_pred = []
-    val_losses = []
-    val_emb_losses = []
-    val_pred_losses = []
-    val_accuracy = []
-    val_n_pred = []
     
+    train_n_pred, val_n_pred = [], []
     
-    for epoch in range(num_epochs):
+    for epoch in tqdm(range(num_epochs)):
+
+        """
+        TRAINING
+        """
         model.train()
 
         # keep track of taining losses
@@ -37,17 +58,19 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
         total_pred_train_loss = 0
         n_correct_train = 0
         n_pred_train = 0 # number of valid predictions (gt action exists)
+        n_correct_past_train = 0
+        n_pred_past_train = 0
+        n_correct_future_train = 0
+        n_pred_future_train = 0
 
         for batch in train_loader:
             # Move data to device
             state0 = batch['state0'].to(device)
-            state1 = batch['state1'].to(device)
             action_indices = batch['action_indices'].to(device)
             reward = batch['reward'].to(device)
             mask = batch["mask"].to(device)
             future_state = batch["future_state"].to(device)
             future_action_indices = batch["future_action_indices"].to(device)
-            # future_rewards  = batch["future_reward"].to(device)
             future_mask = batch["future_mask"].to(device)
 
             # Concatenate inputs
@@ -81,16 +104,25 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                 gt_mask = future_mask[:,:logits.shape[1]]
                 gt_actions = future_action_indices[:,:logits.shape[1]]
                 gt_actions[gt_mask == 0] = -100
+                n_pred_future_train += gt_mask.sum().item()
+                n_correct_future_train += (predicted_actions == gt_actions).sum().item()
             elif model.prediction_type == PredictionTypes.PAST_FUTURE:
                 assert action_indices.shape[1] == model.n_past_steps, "make sure n_past_steps and the number of actions in the trajectory matches"
                 gt_actions = torch.cat((action_indices, future_action_indices[:,:model.n_future_steps]), dim=1)
                 gt_mask = torch.cat((mask, future_mask[:,:model.n_future_steps]), dim=1)
                 gt_actions[gt_mask == 0] = -100
+                # breakpoint()
+                n_pred_past_train += gt_mask[:model.n_past_steps].sum().item()
+                n_correct_past_train += (predicted_actions[:model.n_past_steps] == gt_actions[:model.n_past_steps]).sum().item()
+                n_pred_future_train += gt_mask[model.n_past_steps:].sum().item()
+                n_correct_future_train += (predicted_actions[model.n_past_steps:] == gt_actions[model.n_past_steps:]).sum().item()
             n_correct_train += (predicted_actions == gt_actions).sum().item()
             n_pred_train += gt_mask.sum().item()
             train_n_pred.append(n_pred_train)
 
-        # Validation
+        """
+        EVALUATION
+        """
         model.eval()
 
         # keep track of validation losses
@@ -98,7 +130,11 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
         total_emb_val_loss = 0
         total_pred_val_loss = 0
         n_correct_val = 0
-        n_pred_val = 0 # number of valid predictions (gt action exists)
+        n_pred_val = 0 # number of valid predictions (gt action exists)\
+        n_correct_past_val = 0
+        n_pred_past_val = 0
+        n_correct_future_val = 0
+        n_pred_future_val = 0
 
         with torch.no_grad():
             for batch in val_loader:
@@ -131,14 +167,6 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                 total_val_loss += loss.item()
                 total_emb_val_loss += embedding_loss.item()
                 total_pred_val_loss += pred_loss.item()
-        
-                # # record accuracy
-                # future_mask = future_mask[:,:logits.shape[1]]
-                # predicted_actions = logits.argmax(axis=-1)
-                # gt_actions = future_action_indices[:,:logits.shape[1]]
-                # gt_actions[future_mask == 0] = -100
-                # n_correct_val += (predicted_actions == gt_actions).sum().item()
-                # n_pred_val += future_mask.sum().item()
 
                 # record accuracy
                 predicted_actions = logits.argmax(axis=-1)
@@ -151,46 +179,46 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                     gt_actions = torch.cat((action_indices, future_action_indices[:,:model.n_future_steps]), dim=1)
                     gt_mask = torch.cat((mask, future_mask[:,:model.n_future_steps]), dim=1)
                     gt_actions[gt_mask == 0] = -100
+                    n_pred_past_val += gt_mask[:model.n_past_steps].sum().item()
+                    n_correct_past_val += (predicted_actions[:model.n_past_steps] == gt_actions[:model.n_past_steps]).sum().item()
+                    n_pred_future_val += gt_mask[model.n_past_steps:].sum().item()
+                    n_correct_future_val += (predicted_actions[model.n_past_steps:] == gt_actions[model.n_past_steps:]).sum().item()
                 n_correct_val += (predicted_actions == gt_actions).sum().item()
                 n_pred_val += gt_mask.sum().item()
                 val_n_pred.append(n_pred_val)
 
-                # TODO - run autoregressive inference 
-
-        avg_train_loss = total_train_loss / len(train_loader)
-        avg_emb_train_loss = total_emb_trian_loss / len(train_loader)
-        avg_pred_train_loss = total_pred_train_loss / len(train_loader)
-        avg_val_loss = total_val_loss / len(val_loader)
-        avg_emb_val_loss = total_emb_val_loss / len(val_loader)
-        avg_pred_val_loss = total_pred_val_loss / len(val_loader)
-        avg_pred_train_accuracy = n_correct_train / n_pred_train
-        avg_pred_val_accuracy = n_correct_val / n_pred_val
-        
-        train_losses.append(avg_train_loss)
-        train_emb_losses.append(avg_emb_train_loss)
-        train_pred_losses.append(avg_pred_train_loss)
-        train_accuracy.append(avg_pred_train_accuracy)
-        val_losses.append(avg_val_loss)
-        val_emb_losses.append(avg_emb_val_loss)
-        val_pred_losses.append(avg_pred_val_loss)
-        val_accuracy.append(avg_pred_val_accuracy)
-
-        print(
-            f'Epoch [{epoch+1}/{num_epochs}], '
-            f'Train Loss: {avg_train_loss:.4f}, '
-            f'Train Loss (embedding): {avg_emb_train_loss:.4f}, '
-            f'Train Loss (prediction): {avg_pred_train_loss:.4f}, '
-            f'Train Accuracy: {avg_pred_train_accuracy:.4f}, '
-            
-            f'Val Loss: {avg_val_loss:.4f}, '
-            f'Val Loss (embedding): {avg_emb_val_loss:.4f}, '
-            f'Val Loss (prediction): {avg_pred_val_loss:.4f}, '
-            f'Val Accuracy: {avg_pred_val_accuracy:.4f}, '
-            # f'Perplexity: {perplexity:.4f}'
-        )
+        """
+        LOGGING
+        """
+        wandb.run.log({
+            "train_loss": total_train_loss / len(train_loader),
+            "train_loss_embedding": total_emb_trian_loss / len(train_loader),
+            "train_loss_prediction": total_pred_train_loss / len(train_loader),
+            "valid_loss": total_val_loss / len(val_loader),
+            "valid_loss_embedding": total_emb_val_loss / len(val_loader),
+            "valid_loss_prediction": total_pred_val_loss / len(val_loader),
+            "train_accuracy": n_correct_train / n_pred_train,
+            "train_accuracy_past": n_correct_past_train / n_pred_past_train,
+            "train_accuracy_future": n_correct_future_train / n_pred_future_train,
+            "valid_accuracy": n_correct_val / n_pred_val,
+            "valid_accuracy_past": n_correct_past_val / n_pred_past_val,
+            "valid_accyracy_future": n_correct_future_val / n_pred_future_val,
+        })
     
-    return (train_losses, train_emb_losses, train_pred_losses, train_accuracy, train_n_pred,
-        val_losses, val_emb_losses, val_pred_losses, val_accuracy, val_n_pred)
+        # save model checkpoint
+        if epoch > 0 and (epoch % args.save_interval) == 0:
+            torch.save(optimizer.state_dict(), f"{wandb.run.dir}/optimizer_epoch_{epoch}.pt")
+            torch.save(model.state_dict(), f"{wandb.run.dir}/checkpoint_epoch_{epoch}.pt")
+            wandb.save(f"{wandb.run.dir}/optimizer_epoch_{epoch}.pt", base_path=wandb.run.dir, policy="now")
+            wandb.save(f"{wandb.run.dir}/checkpoint_epoch_{epoch}.pt", base_path=wandb.run.dir, policy="now")
+    
+    # save final checkpoint
+    torch.save(optimizer.state_dict(), f"{wandb.run.dir}/optimizer_epoch_{epoch}.pt")
+    torch.save(model.state_dict(), f"{wandb.run.dir}/checkpoint_epoch_{epoch}.pt")
+    wandb.save(f"{wandb.run.dir}/optimizer_epoch_{epoch}.pt", base_path=wandb.run.dir, policy="now")
+    wandb.save(f"{wandb.run.dir}/checkpoint_epoch_{epoch}.pt", base_path=wandb.run.dir, policy="now")
+    
+    return
 
 def eval_vqvae(model, train_loader, val_loader, save_dir, device):
 
@@ -360,57 +388,39 @@ def plot_tsne(z_qs, agent_labels, savename):
         plt.savefig(save_file)
 
 def main(args):
-    ####### Hyperparameters #######    
-    """Dataset Settings"""
-    input_seq_len = 30 # number of past steps to feed into encoder
-    """Encoder Settings"""
-    in_dim = 88 # per-timestep feature dimension (len(obs + action + reward))
-    h_dim = 64
-    bidirectional = True
-    n_res_layers = 1
-    n_embeddings = 6
-    embedding_dim = 64
-    """Decoder Settings"""
-    state_dim = 86 # dimension of state the decoder sees as input
-    n_actions = 3 # number of discrete actions
-    n_future_steps = 10
-    decoder_context_dim = 128
-    n_attention_heads = 4
-    n_decoder_layers = 2
-    """Training Settings"""
-    beta = 0.25
-    num_epochs = 200
-    batch_size = 32
-    learning_rate = 1e-4
-    ####### Hyperparameters #######    
+    # seeding
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = args.torch_deterministic
 
     # make directory to save result plots
     save_dir = os.path.join("results", args.plot_dir)
     os.makedirs(save_dir, exist_ok=True)
 
     # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     print(f"Using device: {device}")
     
     # Load data
     print("Loading data...")
     training_data, validation_data, train_loader, val_loader, x_train_var = load_data_and_data_loaders(
-        dataset='MINIGRID', batch_size=batch_size, sequence_len=input_seq_len)
+        dataset='MINIGRID', batch_size=args.batch_size, sequence_len=args.input_seq_len)
 
     # Initialize model
     model = RNNVQVAE(
-        in_dim=in_dim,
-        state_dim=state_dim,
-        h_dim=h_dim,
-        n_embeddings=n_embeddings,
-        bidirectional=bidirectional,
-        beta=beta,
-        n_actions=n_actions,
-        n_future_steps=n_future_steps,  
-        n_past_steps=input_seq_len, 
-        decoder_context_dim=decoder_context_dim,
-        n_attention_heads=n_attention_heads,
-        n_decoder_layers=n_decoder_layers,
+        in_dim=args.in_dim,
+        state_dim=args.state_dim,
+        h_dim=args.h_dim,
+        n_embeddings=args.n_embeddings,
+        bidirectional=args.bidirectional,
+        beta=args.beta,
+        n_actions=args.n_actions,
+        n_future_steps=args.n_future_steps,  
+        n_past_steps=args.input_seq_len, 
+        decoder_context_dim=args.decoder_context_dim,
+        n_attention_heads=args.n_attention_heads,
+        n_decoder_layers=args.n_decoder_layers,
     ).to(device)
     # model = RNNFutureVQVAE(
     #     in_dim=in_dim,
@@ -428,90 +438,49 @@ def main(args):
 
     # Train model
     print("Starting training...")
-    train_losses, train_emb_losses, train_pred_losses, train_accuracy, train_n_pred, \
-        val_losses, val_emb_losses, val_pred_losses, val_accuracy, val_n_pred \
-            = train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, device)
+    train_vqvae(model, train_loader, val_loader, args.num_epochs, args.learning_rate, device)
     eval_vqvae(model, train_loader, val_loader, save_dir, device)
-
-    # Save results
-    timestamp = readable_timestamp()
-    results = {
-        'train_losses': train_losses,
-        'train_emb_losses': train_emb_losses, 
-        'train_pred_losses': train_pred_losses, 
-        'val_losses': val_losses,
-        'val_emb_losses': val_emb_losses, 
-        'val_pred_losses':val_pred_losses,
-        'x_train_var': x_train_var
-    }
-    hyperparameters = {
-        'h_dim': h_dim,
-        'n_res_layers': n_res_layers,
-        'n_embeddings': n_embeddings,
-        'embedding_dim': embedding_dim,
-        'beta': beta,
-        'num_epochs': num_epochs,
-        'batch_size': batch_size,
-        'learning_rate': learning_rate
-    }
-    save_model_and_results(model, results, hyperparameters, timestamp)
+  
+@dataclass
+class Args:
+    """Torch, cuda, seed"""
+    exp_name: str = "vqvae"
+    seed: int = 1 # NOTE 
+    torch_deterministic: bool = True
+    cuda: bool = True
     
-    # Plot results
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.title('Training and Validation Losses')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, "loss_plot.png"))
-    plt.clf()
+    """Logging"""
+    track: bool = True
+    wandb_project_name: str = "human-knowledge-vqvae"
+    wandb_entity: str = "ahiranak-university-of-southern-california"
+    plot_dir: str = "test"
+    save_interval: int = 20 # number of epochs between each checkpoint saving
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_emb_losses, label='Training Loss')
-    plt.plot(val_emb_losses, label='Validation Loss')
-    plt.title('Training and Validation Losses (Embedding)')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, "emb_loss_plot.png"))
-    plt.clf()
+    """Dataset Settings"""
+    input_seq_len: int = 30 # number of past steps to feed into encoder
     
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_pred_losses, label='Training Loss')
-    plt.plot(val_pred_losses, label='Validation Loss')
-    plt.title('Training and Validation Losses (CE)')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, 'pred_loss_plot.png'))
-    plt.clf()
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_accuracy, label='Training')
-    plt.plot(val_accuracy, label='Validation')
-    plt.title('Training and Validation Accuracies')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, 'accuracy_plot.png'))
-    plt.clf()
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_n_pred, label="Training")
-    plt.plot(val_n_pred, label="Validation")
-    plt.title('Number of valid action predictions')
-    plt.xlabel('Epoch')
-    plt.ylabel('N valid predictions')
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, 'n_valid_predictions.png'))
-    plt.clf()
-
-    plt.close()
+    """Encoder Settings"""
+    in_dim: int = 88 # per-timestep feature dimension (len(obs + action + reward))
+    h_dim: int = 64
+    bidirectional: bool = True
+    n_res_layers: int = 1
+    n_embeddings: int = 6
+    embedding_dim: int = 64
+    
+    """Decoder Settings"""
+    state_dim: int = 86 # dimension of state the decoder sees as input
+    n_actions: int = 3 # number of discrete actions
+    n_future_steps: int = 10
+    decoder_context_dim: int = 128
+    n_attention_heads: int = 4
+    n_decoder_layers: int = 2
+    
+    """Training Hyperparams"""
+    beta: float = 0.25
+    num_epochs: int = 200
+    batch_size: int = 32
+    learning_rate: float = 1e-4    
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--plot-dir", type=str, help="directory to save result plots to")
-    args = parser.parse_args()
-
+    args = tyro.cli(Args)
     main(args) 
