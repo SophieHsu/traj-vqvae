@@ -5,7 +5,61 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 
+"""
+Teacher Training Datasets
+"""
+def trajectory_latent_collate_fn(batch):
+    """
+    Custom collate function for use with TrajectoryLatentDataset
+    """
+    z_e, z_q, mask, agent_id = [], [], [], []
 
+    for traj in batch:
+        z_e.append(traj["z_e"])
+        z_q.append(traj["z_q"])
+        mask.append(traj["mask"])
+        agent_id.append(traj["agent_id"])
+    
+    return {
+        "z_e": torch.stack(z_e),
+        "z_q": torch.stack(z_q),
+        "mask": torch.stack(mask),
+        "agent_id": torch.stack(agent_id),
+    }
+
+class TrajectoryLatentDataset(Dataset):
+    """
+    PyTorch Dataset for trajectory embeddings and corresponding agent label
+    Can be constructed from data_file or raw data
+
+    Args:
+        data_file_path (str): path to hdf5 dataset
+    """
+    def __init__(
+        self,
+        data_file_path,
+    ):
+        self.data = []
+        with h5py.File(data_file_path, "r") as data_file:
+            data_group = data_file["embeddings"]
+            for traj_name in data_group.keys():
+                traj_data = data_group[traj_name]
+                self.data.append({
+                    "z_e": torch.tensor(traj_data["z_e"], dtype=torch.float32),
+                    "z_q": torch.tensor(traj_data["z_q"], dtype=torch.float32),
+                    "mask": torch.tensor(traj_data["mask"], dtype=torch.float32),
+                    "agent_id": torch.tensor(traj_data["agent_id"], dtype=torch.long),
+                })
+
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+"""
+Representation Learning Trajectory Datasets
+"""
 def multiagent_traj_collate_fn(batch):
     """
     Custom collate function for use with MultiAgentTrajectoryDataset
@@ -88,7 +142,8 @@ class MultiAgentTrajectoryDataset(Dataset):
                 state1 = np.array(grp["state1"])
                 action_names = np.array(grp["action_name"], dtype=str)
                 reward = np.array(grp["reward"])
-                
+                agent_id = grp.attrs["agent_id"].item()
+
                 # Convert action names to indices using the predefined mapping
                 action_indices = np.array([action_mapping.get(name, -1) for name in action_names], dtype=np.int64)
                 
@@ -123,7 +178,8 @@ class MultiAgentTrajectoryDataset(Dataset):
                         "future_reward": np.zeros(max_future_traj_len).astype(np.float32),
                         "future_mask": np.zeros(max_future_traj_len).astype(np.float32),
                         "attributes": attributes,
-                        "traj_name": traj_name,
+                        "traj_name": f"{traj_name}_0",
+                        "agent_id": agent_id,
                     })
                 else:
                     # use sliding window to generate samples
@@ -145,7 +201,8 @@ class MultiAgentTrajectoryDataset(Dataset):
                             "future_reward": np.pad(reward[i+self.sequence_len:], pad_width=(0,pad_len)).astype(np.float32),
                             "future_mask": future_mask.astype(np.float32),
                             "attributes": attributes,
-                            "traj_name": traj_name,
+                            "traj_name": f"{traj_name}_{i}",
+                            "agent_id": agent_id,
                         })   
         print("Action mapping:")
         for action, idx in action_mapping.items():
