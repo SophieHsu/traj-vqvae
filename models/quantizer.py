@@ -81,13 +81,21 @@ class VectorQuantizer(nn.Module):
         """
         # reshape z -> (batch, height, width, channel) and flatten
         if self.encoder_type == "conv":
+            raise NotImplementedError("Might be outdated")
             # this encoder type outputs z_e with dimension (B, e_dim, C)
             z = z.permute(0, 2, 1).contiguous() # (B, e_dim, C) -> (B, C, e_dim)
             z_flattened = z.reshape(-1, self.e_dim)
         elif self.encoder_type == "trajrnn":
+            raise NotImplementedError("Might be outdated")
             z_flattened = z
         elif self.encoder_type == "timernn":
+            # z_flattened = z.reshape(-1, self.e_dim)
+            # B, T, D = z.shape
             z_flattened = z.reshape(-1, self.e_dim)
+            if mask is not None:
+                flat_mask = mask.reshape(-1).float().unsqueeze(1)  # (B*T, 1)
+            else:
+                flat_mask = None
         else:
             raise NotImplementedError("encoder_type other than conv and rnn are not supported")
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
@@ -97,31 +105,61 @@ class VectorQuantizer(nn.Module):
             torch.matmul(z_flattened, self.embedding.weight.t())
 
         # find closest encodings
-        min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
+        min_encoding_indices = torch.argmin(d, dim=1, keepdim=True)
         min_encodings = torch.zeros(
             min_encoding_indices.shape[0], self.n_e).to(z.device)
         min_encodings.scatter_(1, min_encoding_indices, 1)
 
-        # get quantized latent vectors
-        z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
+        # # get quantized latent vectors
+        # z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
 
-        # compute loss for embedding (mask out padded timesteps)
-        mask = mask.unsqueeze(-1)
-        commitment_loss = torch.mean(((z_q.detach()-z) * mask) **2)
-        codebook_loss = torch.mean(((z_q - z.detach()) * mask) ** 2)
+        # # compute loss for embedding (mask out padded timesteps)
+        # mask = mask.unsqueeze(-1)
+        # commitment_loss = torch.mean(((z_q.detach()-z) * mask) **2)
+        # codebook_loss = torch.mean(((z_q - z.detach()) * mask) ** 2)
+        # loss = commitment_loss + self.beta * codebook_loss
+
+        # # preserve gradients
+        # z_q = z + (z_q - z).detach()
+
+        # # perplexity
+        # e_mean = torch.mean(min_encodings, dim=0)
+        # perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
+
+        # # reshape back to match original input shape
+        # if self.encoder_type == "conv":
+        #     z_q = z_q.permute(0, 2, 1).contiguous()
+        
+        # Quantized latent vector
+        z_q_flat = torch.matmul(min_encodings, self.embedding.weight)  # (B*T, D)
+
+        # Reshape to original shape
+        z_q = z_q_flat.view_as(z)
+
+        # Compute losses — apply masking to both terms
+        if flat_mask is not None:
+            diff = (z_q_flat.detach() - z_flattened) * flat_mask
+            commitment_loss = torch.sum(diff ** 2) / (flat_mask.sum() + 1e-6)
+
+            diff = (z_q_flat - z_flattened.detach()) * flat_mask
+            codebook_loss = torch.sum(diff ** 2) / (flat_mask.sum() + 1e-6)
+        else:
+            # No masking
+            commitment_loss = F.mse_loss(z_q_flat.detach(), z_flattened)
+            codebook_loss = F.mse_loss(z_q_flat, z_flattened.detach())
+
         loss = commitment_loss + self.beta * codebook_loss
 
-        # preserve gradients
+        # Straight-through estimator
         z_q = z + (z_q - z).detach()
 
-        # perplexity
+        # Perplexity
         e_mean = torch.mean(min_encodings, dim=0)
         perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
 
-        # reshape back to match original input shape
         if self.encoder_type == "conv":
             z_q = z_q.permute(0, 2, 1).contiguous()
-        
+
         return loss, z_q, perplexity, min_encodings, min_encoding_indices
 
 

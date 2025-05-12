@@ -179,8 +179,7 @@ class RNNVQVAE(nn.Module):
         future_mask = x["future_mask"]
 
         # get embedding corresponding to the last non-masked timestep for each trajectory
-        z_e = self.encoder(traj)
-        # breakpoint()
+        z_e = self.encoder(traj, mask)
         # last_real_index = mask.shape[1] - 1 - torch.argmax(torch.flip(mask, dims=[1]), axis=1)
         # z_e = z_e[torch.arange(z_e.shape[0]), last_real_index]
         # pass through VQ layer
@@ -222,7 +221,7 @@ class RNNVQVAE(nn.Module):
         mask = x["mask"]
 
         # get embedding corresponding to the last non-masked timestep for each trajectory
-        z_e = self.encoder(traj)
+        z_e = self.encoder(traj, mask)
 
         # pass through VQ layer
         embedding_loss, z_q, perplexity, min_encodings, min_encoding_indices = self.vector_quantization(z_e, mask)

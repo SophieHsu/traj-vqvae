@@ -1,6 +1,7 @@
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 # import torch.nn.functional as F
 import numpy as np
 import os
@@ -122,14 +123,38 @@ class RNNEncoder(nn.Module):
             bidirectional=bidirectional
         )
 
-    def forward(self, x, lengths=None):
+    # def forward(self, x, lengths=None):
+    #     """
+    #     x: Tensor of shape (B, T, in_dim)
+    #     """
+    #     out, _ = self.rnn(x)
+
+    #     return out  # Shape: (B, T, h_dim * num_directions)
+
+    def forward(self, x, mask, lengths=None):
         """
         x: Tensor of shape (B, T, in_dim)
         """
-        out, _ = self.rnn(x)
+        if mask is not None:
+            lengths = mask.sum(dim=1).cpu()
+        else:
+            lengths = torch.full((x.size(0),), x.size(1), dtype=torch.long, device=x.device)
 
-        return out  # Shape: (B, T, h_dim * num_directions)
+        # Sort by lengths (required by pack_padded_sequence)
+        lengths_sorted, sort_idx = lengths.sort(descending=True)
+        x_sorted = x[sort_idx]
 
+        packed_x = pack_padded_sequence(x_sorted, lengths_sorted, batch_first=True)
+        packed_out, _ = self.rnn(packed_x)
+
+        # pad the output back to the original shape
+        out_sorted, _ = pad_packed_sequence(packed_out, batch_first=True, total_length=x.shape[1]) 
+
+        # Unsort to restore original batch order
+        _, unsort_idx = sort_idx.sort()
+        out = out_sorted[unsort_idx]
+
+        return out
 
 
 if __name__ == "__main__":

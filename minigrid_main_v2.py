@@ -28,7 +28,7 @@ from dataclasses import dataclass
 def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, device):
 
     # setup wandb logging
-    run_name = f"{args.exp_name}_{args.seed}_{int(time.time())}"
+    run_name = f"{args.exp_name}_{args.seed}_{args.plot_dir}_{int(time.time())}"
     if args.track:
         wandb.init(
             project=args.wandb_project_name,
@@ -360,28 +360,41 @@ def plot_codebook_usage_heatmap(token_ids, agent_labels, n_embeddings, savefile)
     plt.clf()
 
 def plot_tsne(z_qs, agent_labels, savename):
+
+    assert args.n_components in [2, 3], "visualization is only available for n_components = 2 or 3"
+
     z_qs_flattened = np.transpose(z_qs, (0, 2, 1)).reshape(z_qs.shape[0], -1) # flatten 
     
     # reduce dimensionality with PCA
     z_pca = PCA(n_components=100).fit_transform(z_qs_flattened) 
     
     # apply t-SNE
-    z_tsne = TSNE(n_components=2, perplexity=5).fit_transform(z_pca)
+    z_tsne = TSNE(n_components=args.n_components, perplexity=5).fit_transform(z_pca)
 
     unique_agents = sorted(set(agent_labels))
     colors = plt.cm.tab10.colors
     agent_to_color = {agent: colors[i % len(colors)] for i, agent in enumerate(unique_agents)}
 
-    plt.figure(figsize=(8, 6))
+    fig = plt.figure(figsize=(8, 6))
+    if args.n_components == 3:
+        ax = fig.add_subplot(projection="3d")
+
     for agent in unique_agents:
         save_file = f"{savename}_{agent}.png"
         inds = np.where(agent_labels == agent)[0]
         tsne_latents = z_tsne[inds]
-        plt.scatter(
-            tsne_latents[:,0], tsne_latents[:,1], 
-            color=agent_to_color[agent], 
-            label=f"Agent {agent}",
-        )
+        if args.n_components == 2:
+            plt.scatter(
+                tsne_latents[:,0], tsne_latents[:,1], 
+                color=agent_to_color[agent], 
+                label=f"Agent {agent}",
+            )
+        elif args.n_components == 3:
+            ax.scatter(
+                tsne_latents[:,0], tsne_latents[:,1], tsne_latents[:,2],
+                color=agent_to_color[agent],
+                label=f"Agent {agent}",
+            )
         plt.title(f"Trajectory-level z_q Embeddings (Flattened) {agent}")
         plt.legend()
         plt.tight_layout()
@@ -454,7 +467,7 @@ class Args:
     wandb_project_name: str = "human-knowledge-vqvae"
     wandb_entity: str = "ahiranak-university-of-southern-california"
     plot_dir: str = "test"
-    save_interval: int = 20 # number of epochs between each checkpoint saving
+    save_interval: int = 50 # number of epochs between each checkpoint saving
 
     """Dataset Settings"""
     input_seq_len: int = 30 # number of past steps to feed into encoder
@@ -477,9 +490,12 @@ class Args:
     
     """Training Hyperparams"""
     beta: float = 0.25
-    num_epochs: int = 200
+    num_epochs: int = 300
     batch_size: int = 32
-    learning_rate: float = 1e-4    
+    learning_rate: float = 1e-4  
+
+    """Visualization Settings"""
+    n_components: int = 2 # number of components to flatten zq for visualization (2 or 3)  
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
