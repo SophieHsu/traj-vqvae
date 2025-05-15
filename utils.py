@@ -6,6 +6,7 @@ import time
 import os
 from datasets.block import BlockDataset, LatentBlockDataset
 from load_traj import TrajectoryDataset, MultiAgentTrajectoryDataset, traj_data_loaders, multiagent_traj_data_loaders
+from human_knowledge_utils import BalancedAgentSampler, get_agent_to_indices
 import numpy as np
 
 
@@ -92,9 +93,10 @@ def load_data_and_data_loaders(dataset, batch_size, **kwargs):
 
     elif dataset == 'MINIGRID':
         # data_file = "data/minigrid/nored-lrf-mapupdate-penalty0.005.hdf5"
-        data_file = "data/minigrid/4-rooms-1k/combined.hdf5"
+        data_file = "data/minigrid/4-rooms-small/6agents.hdf5" # 50k steps per agent version
+        # data_file = "data/minigrid/4-rooms-1k/combined.hdf5" # 1k trajectories per agent version
         # full_dataset = TrajectoryDataset(data_file)
-        full_dataset = MultiAgentTrajectoryDataset(data_file, **kwargs)
+        full_dataset = MultiAgentTrajectoryDataset(data_file, kwargs["sequence_len"])
         n_total = len(full_dataset)
         n_val = int(n_total * 0.2)  # 20% for validation
         n_train = n_total - n_val
@@ -102,10 +104,20 @@ def load_data_and_data_loaders(dataset, batch_size, **kwargs):
 
         # Split the dataset into training and validation subsets
         training_data, validation_data = random_split(full_dataset, [n_train, n_val])
-        
+
         # Create DataLoaders for both subsets
-        # training_loader, validation_loader = traj_data_loaders(training_data, validation_data, batch_size)
-        training_loader, validation_loader = multiagent_traj_data_loaders(training_data, validation_data, batch_size)
+        if kwargs["balanced_sampling"]:
+            train_agent_to_data_idx = get_agent_to_indices(training_data)
+            valid_agent_to_data_idx = get_agent_to_indices(validation_data)
+            train_sampler = BalancedAgentSampler(train_agent_to_data_idx)
+            valid_sampler = BalancedAgentSampler(valid_agent_to_data_idx)
+            training_loader, validation_loader = multiagent_traj_data_loaders(
+                training_data, validation_data, batch_size, 
+                train_sampler=train_sampler, valid_sampler=valid_sampler,
+            )
+        else:  
+            # training_loader, validation_loader = traj_data_loaders(training_data, validation_data, batch_size)
+            training_loader, validation_loader = multiagent_traj_data_loaders(training_data, validation_data, batch_size)
         
         # Compute the variance of the training states (using the "state0" data)
         all_states = []

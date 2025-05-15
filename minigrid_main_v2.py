@@ -54,8 +54,10 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
 
         # keep track of taining losses
         total_train_loss = 0
-        total_emb_trian_loss = 0
-        total_pred_train_loss = 0
+        total_emb_train_loss_raw = 0
+        total_pred_train_loss_raw = 0
+        total_emb_train_loss_weighted = 0
+        total_pred_train_loss_weighted = 0
         n_correct_train = 0
         n_pred_train = 0 # number of valid predictions (gt action exists)
         n_correct_past_train = 0
@@ -63,6 +65,8 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
         n_correct_future_train = 0
         n_pred_future_train = 0
 
+        sampled_agents_train = {i: 0 for i in range(6)}
+        sampled_agents_valid = {i: 0 for i in range(6)}
         for batch in train_loader:
             # Move data to device
             state0 = batch['state0'].to(device)
@@ -72,6 +76,9 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             future_state = batch["future_state"].to(device)
             future_action_indices = batch["future_action_indices"].to(device)
             future_mask = batch["future_mask"].to(device)
+            
+            for key in sampled_agents_train.keys():
+                sampled_agents_train[key] += batch["agent_id"].tolist().count(key)
 
             # Concatenate inputs
             x = torch.cat([state0, action_indices.unsqueeze(-1).float(), reward.unsqueeze(-1)], dim=-1)
@@ -87,7 +94,9 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             })
 
             # Total loss
-            loss = pred_loss + embedding_loss
+            pred_loss_weighted = args.prediction_loss_weight * pred_loss
+            embedding_loss_weighted = args.embedding_loss_weight * embedding_loss
+            loss = pred_loss_weighted + embedding_loss_weighted
             
             # Backward pass
             optimizer.zero_grad()
@@ -95,9 +104,11 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             optimizer.step()
             
             total_train_loss += loss.item()
-            total_emb_trian_loss += embedding_loss.item()
-            total_pred_train_loss += pred_loss.item()
-
+            total_emb_train_loss_raw += embedding_loss.item()
+            total_pred_train_loss_raw += pred_loss.item()
+            total_emb_train_loss_weighted += embedding_loss_weighted.item()
+            total_pred_train_loss_weighted += pred_loss_weighted.item()
+            
             # record accuracy
             predicted_actions = logits.argmax(axis=-1)
             if model.prediction_type == PredictionTypes.FUTURE:
@@ -127,8 +138,10 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
 
         # keep track of validation losses
         total_val_loss = 0
-        total_emb_val_loss = 0
-        total_pred_val_loss = 0
+        total_emb_val_loss_raw = 0
+        total_pred_val_loss_raw = 0
+        total_emb_val_loss_weighted = 0
+        total_pred_val_loss_weighted = 0
         n_correct_val = 0
         n_pred_val = 0 # number of valid predictions (gt action exists)\
         n_correct_past_val = 0
@@ -149,6 +162,9 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                 # future_rewards  = batch["future_reward"].to(device)
                 future_mask = batch["future_mask"].to(device)
 
+                for key in sampled_agents_valid.keys():
+                    sampled_agents_valid[key] += batch["agent_id"].tolist().count(key)
+
                 # Concatenate inputs
                 x = torch.cat([state0, action_indices.unsqueeze(-1).float(), reward.unsqueeze(-1)], dim=-1)
                 
@@ -162,11 +178,15 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                     "future_mask": future_mask,
                 })
                 
-                loss = pred_loss + embedding_loss
+                pred_loss_weighted = args.prediction_loss_weight * pred_loss
+                embedding_loss_weighted = args.embedding_loss_weight * embedding_loss
+                loss = pred_loss_weighted + embedding_loss_weighted
                 
                 total_val_loss += loss.item()
-                total_emb_val_loss += embedding_loss.item()
-                total_pred_val_loss += pred_loss.item()
+                total_emb_val_loss_raw += embedding_loss.item()
+                total_pred_val_loss_raw += pred_loss.item()
+                total_emb_val_loss_weighted += embedding_loss_weighted.item()
+                total_pred_val_loss_weighted += pred_loss_weighted.item()
 
                 # record accuracy
                 predicted_actions = logits.argmax(axis=-1)
@@ -187,16 +207,28 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                 n_pred_val += gt_mask.sum().item()
                 val_n_pred.append(n_pred_val)
 
+        # print("sampled agents during training", sampled_agents_train)
+        # print("sampled agents during validation", sampled_agents_valid)
         """
         LOGGING
         """
         wandb.run.log({
             "train_loss": total_train_loss / len(train_loader),
-            "train_loss_embedding": total_emb_trian_loss / len(train_loader),
-            "train_loss_prediction": total_pred_train_loss / len(train_loader),
+
+            "train_loss_embedding_raw": total_emb_train_loss_raw / len(train_loader),
+            "train_loss_prediction_raw": total_pred_train_loss_raw / len(train_loader),
+
+            "train_loss_embedding_weighted": total_emb_train_loss_weighted / len(train_loader),
+            "train_loss_prediction_weighted": total_pred_train_loss_weighted / len(train_loader),
+
             "valid_loss": total_val_loss / len(val_loader),
-            "valid_loss_embedding": total_emb_val_loss / len(val_loader),
-            "valid_loss_prediction": total_pred_val_loss / len(val_loader),
+
+            "valid_loss_embedding_raw": total_emb_val_loss_raw / len(val_loader),
+            "valid_loss_prediction_raw": total_pred_val_loss_raw / len(val_loader),
+            
+            "valid_loss_embedding_weighted": total_emb_val_loss_weighted / len(val_loader),
+            "valid_loss_prediction_weighted": total_pred_val_loss_weighted / len(val_loader),
+            
             "train_accuracy": n_correct_train / n_pred_train,
             "train_accuracy_past": n_correct_past_train / n_pred_past_train,
             "train_accuracy_future": n_correct_future_train / n_pred_future_train,
@@ -418,7 +450,7 @@ def main(args):
     # Load data
     print("Loading data...")
     training_data, validation_data, train_loader, val_loader, x_train_var = load_data_and_data_loaders(
-        dataset='MINIGRID', batch_size=args.batch_size, sequence_len=args.input_seq_len)
+        dataset='MINIGRID', batch_size=args.batch_size, sequence_len=args.input_seq_len, balanced_sampling=args.balanced_sampling)
 
     # Initialize model
     model = RNNVQVAE(
@@ -471,6 +503,7 @@ class Args:
 
     """Dataset Settings"""
     input_seq_len: int = 30 # number of past steps to feed into encoder
+    balanced_sampling: bool = True # if True, sample approximately equally from each agent
     
     """Encoder Settings"""
     in_dim: int = 88 # per-timestep feature dimension (len(obs + action + reward))
@@ -492,7 +525,9 @@ class Args:
     beta: float = 0.25
     num_epochs: int = 300
     batch_size: int = 32
-    learning_rate: float = 1e-4  
+    learning_rate: float = 1e-4 
+    embedding_loss_weight: float = 1.0 
+    prediction_loss_weight: float = 1.0
 
     """Visualization Settings"""
     n_components: int = 2 # number of components to flatten zq for visualization (2 or 3)  

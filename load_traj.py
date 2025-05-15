@@ -214,21 +214,39 @@ class MultiAgentTrajectoryDataset(Dataset):
     def __getitem__(self, idx):
         return self.trajectories[idx]
 
-def multiagent_traj_data_loaders(train_data, val_data, batch_size):
-    train_loader = DataLoader(
-        train_data,
-        batch_size=batch_size,
-        shuffle=True,
-        pin_memory=True,
-        collate_fn=multiagent_traj_collate_fn,
-    )
-    val_loader = DataLoader(
-        val_data,
-        batch_size=batch_size,
-        shuffle=True,
-        pin_memory=True,
-        collate_fn=multiagent_traj_collate_fn,
-    )
+def multiagent_traj_data_loaders(train_data, val_data, batch_size, train_sampler=None, valid_sampler=None):
+    if train_sampler is not None:
+        train_loader = DataLoader(
+            train_data,
+            batch_size=batch_size,
+            pin_memory=True,
+            collate_fn=multiagent_traj_collate_fn,
+            sampler=train_sampler,
+        )
+    else:
+        train_loader = DataLoader(
+            train_data,
+            batch_size=batch_size,
+            shuffle=True,
+            pin_memory=True,
+            collate_fn=multiagent_traj_collate_fn,
+        )
+    if valid_sampler is not None:
+        val_loader = DataLoader(
+            val_data,
+            batch_size=batch_size,
+            pin_memory=True,
+            collate_fn=multiagent_traj_collate_fn,
+            sampler=valid_sampler,
+        )
+    else:
+        val_loader = DataLoader(
+            val_data,
+            batch_size=batch_size,
+            shuffle=True,
+            pin_memory=True,
+            collate_fn=multiagent_traj_collate_fn,
+        )
     return train_loader, val_loader
 
 

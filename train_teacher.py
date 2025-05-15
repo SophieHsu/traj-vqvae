@@ -1,6 +1,6 @@
 
 from models.vqvae import RNNVQVAE
-from models.teacher import MaskedMeanClassifier
+from models.teacher import MaskedMeanClassifier, FinalStepClassifier
 from load_traj import TrajectoryLatentDataset, MultiAgentTrajectoryDataset, trajectory_latent_collate_fn
 
 import torch
@@ -20,17 +20,26 @@ import yaml
 import inspect
 import h5py
 
+TEACHER_MODELS = {
+    "MaskedMeanClassifier": MaskedMeanClassifier,
+    "FinalStepClassifier": FinalStepClassifier,
+}
+
 @dataclass
 class Args:
     """Trained VQVAE model"""
-    model_dir: str = None # directory the model checkpoint and config yaml are stored
-    # model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/4R_30past_10future_cb512"
-    checkpoint_file: str = None # name of vqvae checkpoint file inside model_dir
-    # checkpoint_file: str = "checkpoint_epoch_299.pt"
-    raw_data_path: str = None # raw trajectory data path used to generate new dataset if data_path is not provided. ignored if data_path is provided
-    # raw_data_path: str = "/home/ayanoh/traj-vqvae/data/minigrid/4-rooms-1k/combined.hdf5" 
+    # model_dir: str = None # directory the model checkpoint and config yaml are stored
+    # model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/4R1k_30past_10future_cb512_balanced_1000" # one trained with balaned sampler
+    model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/4R_30past_10future_cb512_1000epochs" # one trained with balaned sampler
+
+    # checkpoint_file: str = None # name of vqvae checkpoint file inside model_dir
+    checkpoint_file: str = "checkpoint_epoch_999.pt"
+
+    # raw_data_path: str = None # raw trajectory data path used to generate new dataset if data_path is not provided. ignored if data_path is provided
+    raw_data_path: str = "/home/ayanoh/traj-vqvae/data/minigrid/4-rooms-1k/combined.hdf5" 
+    
     # data_path: str = None
-    data_path: str = "/home/ayanoh/traj-vqvae/data/teacher/minigrid/4-rooms-1k/4R_30past_10future_cb512/combined.hdf5" # path to teacher training dataset
+    data_path: str = "/home/ayanoh/traj-vqvae/data/teacher/minigrid/4-rooms-1k/4R_30past_10future_cb512_1000epochs/combined.hdf5" # path to teacher training dataset
 
     """Torch, cuda, seed"""
     exp_name: str = "masked_mean_classifier"
@@ -42,10 +51,10 @@ class Args:
     track: bool = True
     wandb_project_name: str = "human-knowledge-teacher"
     wandb_entity: str = "ahiranak-university-of-southern-california"
-    plot_dir: str = "test"
-    save_interval: int = 50 # number of epochs between each checkpoint saving
+    save_interval: int = 100 # number of epochs between each checkpoint saving
 
     """Teacher Model Settings"""
+    teacher_model_type: str = "MaskedMeanClassifier"
     hidden_dim: int = 256
 
     """Training Hyperparams"""
@@ -250,6 +259,7 @@ def main(args):
         checkpoint_file=args.checkpoint_file,
         data_path=args.data_path,
     )
+    # breakpoint()
     train_loader = DataLoader(
         train_data,
         batch_size=args.batch_size,
@@ -267,7 +277,8 @@ def main(args):
     print("Dataloaders ready")
 
     # initialize model
-    model = MaskedMeanClassifier(
+    model_class = TEACHER_MODELS[args.teacher_model_type]
+    model = model_class(
         embedding_dim=train_data[0]["z_q"].shape[1],
         num_classes=6,
         hidden_dim=args.hidden_dim,
