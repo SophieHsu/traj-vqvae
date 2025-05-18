@@ -2,6 +2,7 @@
 from models.vqvae import RNNVQVAE
 from models.teacher import MaskedMeanClassifier, FinalStepClassifier
 from load_traj import TrajectoryLatentDataset, MultiAgentTrajectoryDataset, trajectory_latent_collate_fn
+from human_knowledge_utils import misclassification_validity_check
 
 import torch
 from torch.utils.data import DataLoader, random_split
@@ -28,18 +29,18 @@ TEACHER_MODELS = {
 @dataclass
 class Args:
     """Trained VQVAE model"""
-    # model_dir: str = None # directory the model checkpoint and config yaml are stored
+    model_dir: str = None # directory the model checkpoint and config yaml are stored
     # model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/4R1k_30past_10future_cb512_balanced_1000" # one trained with balaned sampler
-    model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/4R_30past_10future_cb512_1000epochs" # one trained with balaned sampler
+    # model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/4R_30past_10future_cb512_1000epochs" # one trained with balaned sampler
 
-    # checkpoint_file: str = None # name of vqvae checkpoint file inside model_dir
-    checkpoint_file: str = "checkpoint_epoch_999.pt"
+    checkpoint_file: str = None # name of vqvae checkpoint file inside model_dir
+    # checkpoint_file: str = "checkpoint_epoch_999.pt"
 
-    # raw_data_path: str = None # raw trajectory data path used to generate new dataset if data_path is not provided. ignored if data_path is provided
-    raw_data_path: str = "/home/ayanoh/traj-vqvae/data/minigrid/4-rooms-1k/combined.hdf5" 
+    raw_data_path: str = None # raw trajectory data path used to generate new dataset if data_path is not provided. ignored if data_path is provided
+    # raw_data_path: str = "/home/ayanoh/traj-vqvae/data/minigrid/4-rooms-1k/combined.hdf5" 
     
-    # data_path: str = None
-    data_path: str = "/home/ayanoh/traj-vqvae/data/teacher/minigrid/4-rooms-1k/4R_30past_10future_cb512_1000epochs/combined.hdf5" # path to teacher training dataset
+    data_path: str = None
+    # data_path: str = "/home/ayanoh/traj-vqvae/data/teacher/minigrid/4-rooms-1k/4R_30past_10future_cb512_1000epochs/combined.hdf5" # path to teacher training dataset
 
     """Torch, cuda, seed"""
     exp_name: str = "masked_mean_classifier"
@@ -48,7 +49,7 @@ class Args:
     cuda: bool = True
     
     """Logging"""
-    track: bool = True
+    track: bool = False
     wandb_project_name: str = "human-knowledge-teacher"
     wandb_entity: str = "ahiranak-university-of-southern-california"
     save_interval: int = 100 # number of epochs between each checkpoint saving
@@ -121,7 +122,9 @@ def prepare_data(raw_data_path=None, model_dir=None, checkpoint_file=None, data_
             reward = torch.tensor(traj["reward"], dtype=torch.float32)
             mask = torch.tensor(traj["mask"], dtype=torch.long)
             agent_id = traj["agent_id"]
-            
+            vis_collision_hist = torch.tensor(traj["vis_wall_collision_hist"], dtype=torch.bool)
+            invis_collision_hist = torch.tensor(traj["invis_wall_collision_hist"], dtype=torch.bool)
+
             x = torch.cat([state, action_indices.unsqueeze(-1).float(), reward.unsqueeze(-1)], dim=-1)
             z_e, z_q, min_encodings, min_encoding_indices = vqvae_model.get_embeddings(
                 x={
@@ -134,6 +137,9 @@ def prepare_data(raw_data_path=None, model_dir=None, checkpoint_file=None, data_
             traj_i.create_dataset("z_q", shape=z_q.shape[1:], dtype=float, data=z_q.detach().cpu())
             traj_i.create_dataset("agent_id", shape=(1,), dtype=int, data=agent_id)
             traj_i.create_dataset("mask", shape=mask.shape, dtype=int, data=mask)
+            traj_i.create_dataset("action", shape=action_indices.shape, dtype=int, data=action_indices)
+            traj_i.create_dataset("vis_wall_collision_hist", shape=vis_collision_hist.shape, dtype=bool, data=vis_collision_hist)
+            traj_i.create_dataset("invis_wall_collision_hist", shape=invis_collision_hist.shape, dtype=bool, data=invis_collision_hist)
 
         teacher_data_file.close()
         print("Done")
@@ -166,12 +172,15 @@ def train_teacher(model, train_loader, val_loader, num_epochs, learning_rate, de
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
+    agent_names = [f"A{i}" for i in range(6)]
     for epoch in tqdm(range(num_epochs)):
         model.train()
         total_train_loss = 0
         correct = 0
         train_total = 0
-
+        train_preds, train_gts = [], []
+        actions = []
+        invis_collision_hist = []
         """
         TRAINING
         """
@@ -179,6 +188,8 @@ def train_teacher(model, train_loader, val_loader, num_epochs, learning_rate, de
             z_q = batch["z_q"].to(device)
             mask = batch["mask"].to(device)
             agent_id = batch["agent_id"].to(device).squeeze(1)
+            actions.append(batch["action"])
+            invis_collision_hist.append(batch["invis_wall_collision_hist"])
 
             logits = model(z_q, mask)
             loss = F.cross_entropy(logits, agent_id)
@@ -188,12 +199,20 @@ def train_teacher(model, train_loader, val_loader, num_epochs, learning_rate, de
             
             total_train_loss += loss.item() * z_q.shape[0]
             preds = logits.argmax(dim=1)
+            train_preds.append(preds.detach().cpu())
+            train_gts.append(agent_id.detach().cpu())
             correct += (preds == agent_id).sum().item()
             train_total += agent_id.shape[0]
 
         train_avg_loss = total_train_loss / train_total
         train_accuracy = correct / train_total 
         # print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_avg_loss:.4f} | Acc: {train_accuracy:.4f}%")
+        train_misclass_validity_results = misclassification_validity_check(
+            preds=torch.cat(train_preds),
+            true_labels=torch.cat(train_gts),
+            action_trajs=torch.cat(actions, dim=0),
+            n_invisible_collisions=torch.cat(invis_collision_hist).sum(dim=1),
+        )
 
         """
         VALIDATION
@@ -202,27 +221,62 @@ def train_teacher(model, train_loader, val_loader, num_epochs, learning_rate, de
         val_correct = 0
         total_val_loss = 0
         val_total = 0
+        valid_preds, valid_gts = [], []
+        actions = []
+        invis_collision_hist = []
         with torch.no_grad():
             for batch in val_loader:
                 z_q = batch["z_q"].to(device)
                 mask = batch["mask"].to(device)
                 agent_id = batch["agent_id"].to(device).squeeze(1)
+                actions.append(batch["action"])
+                invis_collision_hist.append(batch["invis_wall_collision_hist"])
+
                 logits = model(z_q, mask)
                 loss = F.cross_entropy(logits, agent_id)
+
                 total_val_loss += loss.item() * z_q.size(0)
                 preds = logits.argmax(dim=1)
+                valid_preds.append(preds.detach().cpu())
+                valid_gts.append(agent_id.detach().cpu())
                 val_correct += (preds == agent_id).sum().item()
                 val_total += agent_id.size(0)
 
         val_avg_loss = total_val_loss / val_total
         val_accuracy = val_correct / val_total 
 
+        val_misclass_validity_results = misclassification_validity_check(
+            preds=torch.cat(valid_preds),
+            true_labels=torch.cat(valid_gts),
+            action_trajs=torch.cat(actions, dim=0),
+            n_invisible_collisions=torch.cat(invis_collision_hist).sum(dim=1),
+        )
         if args.track:
             wandb.run.log({
                 "train_loss": train_avg_loss,
                 "valid_loss": val_avg_loss,
+
                 "train_accuracy": train_accuracy,
                 "valid_accuracy": val_accuracy,
+
+                "train_confusion": wandb.plot.confusion_matrix(
+                    preds=torch.cat(train_preds).tolist(),
+                    y_true=torch.cat(train_gts).tolist(),
+                    class_names=agent_names,
+                    title="train agent classification",
+                ),
+                "valid_confusion": wandb.plot.confusion_matrix(
+                    preds=torch.cat(valid_preds).tolist(),
+                    y_true=torch.cat(valid_gts).tolist(),
+                    class_names=agent_names,
+                    title="valid agent classificaiton",
+                ),
+                
+                "train_valid_incorrect_per_incorrect": train_misclass_validity_results["n_valid_incorrect"] / train_misclass_validity_results["n_incorrect"],
+                "train_valid_incorrect_per_total": train_misclass_validity_results["n_valid_incorrect"] / train_misclass_validity_results["n_total"],
+
+                "valid_valid_incorrect_per_incorrect": val_misclass_validity_results["n_valid_incorrect"] / val_misclass_validity_results["n_incorrect"],
+                "valid_valid_incorrect_per_total": val_misclass_validity_results["n_valid_incorrect"] / val_misclass_validity_results["n_total"],
             })
 
             # save model checkpoint

@@ -13,18 +13,23 @@ def trajectory_latent_collate_fn(batch):
     Custom collate function for use with TrajectoryLatentDataset
     """
     z_e, z_q, mask, agent_id = [], [], [], []
+    action, invis_wall_collision_hist = [], []
 
     for traj in batch:
         z_e.append(traj["z_e"])
         z_q.append(traj["z_q"])
         mask.append(traj["mask"])
         agent_id.append(traj["agent_id"])
+        action.append(traj["action"])
+        invis_wall_collision_hist.append(traj["invis_wall_collision_hist"])
     
     return {
-        "z_e": torch.stack(z_e),
-        "z_q": torch.stack(z_q),
-        "mask": torch.stack(mask),
-        "agent_id": torch.stack(agent_id),
+        "z_e": torch.tensor(np.stack(z_e), dtype=torch.float32),
+        "z_q": torch.tensor(np.stack(z_q), dtype=torch.float32),
+        "mask": torch.tensor(np.stack(mask), dtype=torch.float32),
+        "agent_id": torch.tensor(np.stack(agent_id), dtype=torch.long),
+        "action": torch.tensor(np.stack(action), dtype=torch.long),
+        "invis_wall_collision_hist": torch.tensor(np.stack(invis_wall_collision_hist), dtype=torch.long),
     }
 
 class TrajectoryLatentDataset(Dataset):
@@ -45,10 +50,13 @@ class TrajectoryLatentDataset(Dataset):
             for traj_name in data_group.keys():
                 traj_data = data_group[traj_name]
                 self.data.append({
-                    "z_e": torch.tensor(traj_data["z_e"], dtype=torch.float32),
-                    "z_q": torch.tensor(traj_data["z_q"], dtype=torch.float32),
-                    "mask": torch.tensor(traj_data["mask"], dtype=torch.float32),
-                    "agent_id": torch.tensor(traj_data["agent_id"], dtype=torch.long),
+                    "z_e": np.array(traj_data["z_e"]).astype(np.float32),
+                    "z_q": np.array(traj_data["z_q"]).astype(np.float32),
+                    "mask": np.array(traj_data["mask"]).astype(np.float32),
+                    "agent_id": np.array(traj_data["agent_id"]).astype(np.int64),
+                    "action": np.array(traj_data["action"]).astype(np.int64),
+                    "vis_wall_collision_hist": np.array(traj_data["vis_wall_collision_hist"]).astype(np.int64),
+                    "invis_wall_collision_hist": np.array(traj_data["invis_wall_collision_hist"]).astype(np.int64),
                 })
 
     def __len__(self):
@@ -142,6 +150,8 @@ class MultiAgentTrajectoryDataset(Dataset):
                 state1 = np.array(grp["state1"])
                 action_names = np.array(grp["action_name"], dtype=str)
                 reward = np.array(grp["reward"])
+                vis_wall_collision_hist = np.array(grp["vis_wall_collision_hist"]).astype(np.int64)
+                invis_wall_collision_hist = np.array(grp["invis_wall_collision_hist"]).astype(np.int64)
                 agent_id = grp.attrs["agent_id"].item()
 
                 # Convert action names to indices using the predefined mapping
@@ -177,6 +187,8 @@ class MultiAgentTrajectoryDataset(Dataset):
                         "future_action_indices": np.zeros(max_future_traj_len).astype(np.int64),
                         "future_reward": np.zeros(max_future_traj_len).astype(np.float32),
                         "future_mask": np.zeros(max_future_traj_len).astype(np.float32),
+                        "vis_wall_collision_hist": np.pad(vis_wall_collision_hist, pad_width=(0,pad_len), mode=pad_mode).astype(np.int64),
+                        "invis_wall_collision_hist": np.pad(invis_wall_collision_hist, pad_width=(0,pad_len), mode=pad_mode).astype(np.int64),
                         "attributes": attributes,
                         "traj_name": f"{traj_name}_0",
                         "agent_id": agent_id,
@@ -200,6 +212,8 @@ class MultiAgentTrajectoryDataset(Dataset):
                             "future_action_indices": np.pad(action_indices[i+self.sequence_len:], pad_width=(0,pad_len)).astype(np.int64),
                             "future_reward": np.pad(reward[i+self.sequence_len:], pad_width=(0,pad_len)).astype(np.float32),
                             "future_mask": future_mask.astype(np.float32),
+                            "vis_wall_collision_hist": vis_wall_collision_hist[i:i+self.sequence_len].astype(np.int64),
+                            "invis_wall_collision_hist": invis_wall_collision_hist[i:i+self.sequence_len].astype(np.int64),
                             "attributes": attributes,
                             "traj_name": f"{traj_name}_{i}",
                             "agent_id": agent_id,
@@ -222,6 +236,7 @@ def multiagent_traj_data_loaders(train_data, val_data, batch_size, train_sampler
             pin_memory=True,
             collate_fn=multiagent_traj_collate_fn,
             sampler=train_sampler,
+            drop_last=True,
         )
     else:
         train_loader = DataLoader(
@@ -230,6 +245,7 @@ def multiagent_traj_data_loaders(train_data, val_data, batch_size, train_sampler
             shuffle=True,
             pin_memory=True,
             collate_fn=multiagent_traj_collate_fn,
+            drop_last=True,
         )
     if valid_sampler is not None:
         val_loader = DataLoader(
@@ -238,6 +254,7 @@ def multiagent_traj_data_loaders(train_data, val_data, batch_size, train_sampler
             pin_memory=True,
             collate_fn=multiagent_traj_collate_fn,
             sampler=valid_sampler,
+            drop_last=True,
         )
     else:
         val_loader = DataLoader(
@@ -246,6 +263,7 @@ def multiagent_traj_data_loaders(train_data, val_data, batch_size, train_sampler
             shuffle=True,
             pin_memory=True,
             collate_fn=multiagent_traj_collate_fn,
+            drop_last=True,
         )
     return train_loader, val_loader
 

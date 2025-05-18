@@ -294,22 +294,12 @@ def eval_vqvae(model, train_loader, val_loader, save_dir, device):
 
     model.eval()
 
-    # get agent ids and minimum distance embedding indices for train and valid sets
-    # agent_ids = {}
-    # traj_encoding_indices = {}
-    # z_qs = {}
-    # codebook_usage = {}
-
     dataloaders = {
         "train": train_loader,
         "val": val_loader,
     }
 
     for split, loader in dataloaders.items():
-        # agent_ids[split] = []
-        # traj_encoding_indices[split] = []
-        # z_qs[split] = []
-        # codebook_usage[split] = []
         agent_ids = []
         codebook_usage = []
         z_qs = []
@@ -344,15 +334,6 @@ def eval_vqvae(model, train_loader, val_loader, save_dir, device):
             z_qs.append(z_q.detach().cpu())
             masks.append(mask.cpu())
 
-            # Get codebook usage per agent
-            # agent_ids[split].append(agent_id)
-            # min_encoding_indices = min_encoding_indices.cpu()
-            # min_encoding_indices = min_encoding_indices.cpu().view(z_e.shape[0], z_e.shape[2])
-            # traj_emb_ind = scipy.stats.mode(min_encoding_indices, axis=1)[0]
-            # traj_encoding_indices[split].append(traj_emb_ind)
-            # z_qs[split].append(z_q.detach().cpu().numpy())
-            # traj_encoding_indices[split].append(min_encoding_indices)
-
         agent_ids = torch.cat(agent_ids)
         codebook_usage = torch.cat(codebook_usage, dim=0)
         z_qs = torch.cat(z_qs, dim=0)
@@ -374,58 +355,6 @@ def eval_vqvae(model, train_loader, val_loader, save_dir, device):
         )
 
         plot_tsne(per_agent_data=per_agent_data, savename=os.path.join(save_dir, f"zq_tsne_{split}"))
-
-
-        # plotting
-        # TODO - fix masking in evaluation
-        # n_embs = model.vector_quantization.n_e # codebook size
-        # plot_codebook_usage_per_agent(
-        #     token_ids=traj_encoding_indices[split], 
-        #     agent_labels=agent_ids[split],
-        #     n_embeddings=n_embs,
-        #     savefile=os.path.join(save_dir, f"codebook_use_{split}.png")
-        # )
-        # plot_codebook_usage_heatmap(
-        #     token_ids=traj_encoding_indices[split], 
-        #     agent_labels=agent_ids[split], 
-        #     n_embeddings=n_embs,
-        #     savefile=os.path.join(save_dir, f"codebook_heatmap_{split}.png"),
-        # )
-        # plot_tsne(
-        #     z_qs=z_qs[split],
-        #     agent_labels=agent_ids[split],
-        #     # savefile=os.path.join(save_dir, f"zq_tsne_{split}.png"),
-        #     savename=os.path.join(save_dir, f"zq_tsne_{split}"),
-        # )
-
-    # # count the number of times each agent's trajectory maps to each embedding id
-    # unique_agent_ids = np.arange(6)
-    # unique_emb_ids = np.arange(n_embs)
-
-    # counts = {} # agent_id: np.array(# traj mapping to emb 0, # traj mapping to emb1, ..)
-
-    # for split in dataloaders.keys():
-    #     counts[split] = {}
-    #     for agent_id in unique_agent_ids:
-    #         emb_id_mode = scipy.stats.mode(traj_encoding_indices[split], axis=1)[0]
-    #         emb_counts = np.bincount(
-    #             emb_id_mode[np.where(agent_ids[split] == agent_id)[0]],
-    #             minlength=len(unique_emb_ids), 
-    #         )
-    #         counts[split][agent_id] = emb_counts
-
-    #     # plot
-    #     fig, ax = plt.subplots()
-    #     bottom = np.zeros(n_embs)
-    #     bar_width = 0.25
-    #     for agent_id, cnts in counts[split].items():
-    #         p = ax.bar(unique_emb_ids, cnts, label=f"agent {agent_id}", bottom=bottom)
-    #         bottom += cnts
-    #     ax.set_title(f"Agent ID to Emb ID Mapping ({split})")
-    #     ax.set_xlabel("Agent ID")
-    #     ax.set_ylabel("Codebook Usage Mode")
-    #     ax.legend()
-    #     plt.savefig(f"codebook_usage_mode_{split}.png")
 
 def plot_codebook_usage_heatmap(per_agent_data, n_embeddings, savefile, ignore_id=-100):
     """
@@ -530,10 +459,7 @@ def plot_tsne(per_agent_data, savename):
         plt.savefig(save_file)
 
     plt.clf()
-    # plt.title(f"Trajectory-level z_q Embeddings (Flattened) {agent}")
-    # plt.legend()
-    # plt.tight_layout()
-    # plt.savefig(save_file)
+
 
 def compute_codebook_use_entropy(codebook_ids, agent_labels, codebook_size, ignore_code=-100):
     entropies = {}
@@ -567,66 +493,6 @@ def plot_codebook_usage_per_agent(token_ids, agent_labels, n_embeddings, savefil
     plt.tight_layout()
     plt.savefig(savefile)
     plt.clf()
-
-
-# def plot_codebook_usage_heatmap(token_ids, agent_labels, n_embeddings, savefile):
-#     unique_agents = sorted(set(agent_labels))
-#     agent_to_idx = {a: i for i, a in enumerate(unique_agents)}
-    
-#     usage_matrix = np.zeros((len(unique_agents), n_embeddings))
-
-#     for i, agent in enumerate(agent_labels):
-#         codes, counts = np.unique(token_ids[i], return_counts=True)
-#         usage_matrix[agent_to_idx[agent], codes] += counts
-
-#     plt.figure(figsize=(12, len(unique_agents) * 0.6 + 3))
-#     sns.heatmap(usage_matrix, xticklabels=True, yticklabels=unique_agents, cmap="viridis")
-#     plt.xlabel("Codebook Index")
-#     plt.ylabel("Agent ID")
-#     plt.title("Heatmap of Codebook Usage per Agent")
-#     plt.savefig(savefile)
-#     plt.clf()
-
-# def plot_tsne(z_qs, agent_labels, savename):
-
-#     assert args.n_components in [2, 3], "visualization is only available for n_components = 2 or 3"
-
-#     z_qs_flattened = np.transpose(z_qs, (0, 2, 1)).reshape(z_qs.shape[0], -1) # flatten 
-    
-#     # reduce dimensionality with PCA
-#     z_pca = PCA(n_components=100).fit_transform(z_qs_flattened) 
-    
-#     # apply t-SNE
-#     z_tsne = TSNE(n_components=args.n_components, perplexity=5).fit_transform(z_pca)
-
-#     unique_agents = sorted(set(agent_labels))
-#     colors = plt.cm.tab10.colors
-#     agent_to_color = {agent: colors[i % len(colors)] for i, agent in enumerate(unique_agents)}
-
-#     fig = plt.figure(figsize=(8, 6))
-#     if args.n_components == 3:
-#         ax = fig.add_subplot(projection="3d")
-
-#     for agent in unique_agents:
-#         save_file = f"{savename}_{agent}.png"
-#         inds = np.where(agent_labels == agent)[0]
-#         tsne_latents = z_tsne[inds]
-#         if args.n_components == 2:
-#             plt.scatter(
-#                 tsne_latents[:,0], tsne_latents[:,1], 
-#                 color=agent_to_color[agent], 
-#                 label=f"Agent {agent}",
-#             )
-#         elif args.n_components == 3:
-#             ax.scatter(
-#                 tsne_latents[:,0], tsne_latents[:,1], tsne_latents[:,2],
-#                 color=agent_to_color[agent],
-#                 label=f"Agent {agent}",
-#             )
-#         plt.title(f"Trajectory-level z_q Embeddings (Flattened) {agent}")
-#         plt.legend()
-#         plt.tight_layout()
-#         plt.savefig(save_file)
 
 def main(args):
     # seeding

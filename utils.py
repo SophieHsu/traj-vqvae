@@ -94,7 +94,7 @@ def load_data_and_data_loaders(dataset, batch_size, **kwargs):
     elif dataset == 'MINIGRID':
         # data_file = "data/minigrid/nored-lrf-mapupdate-penalty0.005.hdf5"
         # data_file = "data/minigrid/4-rooms-small/6agents.hdf5" # 50k steps per agent version
-        data_file = "data/minigrid/4-rooms-2.5k-color/6agents.hdf5" # 2.5k per agent, color wall observations
+        data_file = "data/minigrid/4-rooms-2.5k-color/6agents.h5py" # 2.5k per agent, color wall observations
         # data_file = "data/minigrid/4-rooms-1k/combined.hdf5" # 1k trajectories per agent version
         # full_dataset = TrajectoryDataset(data_file)
         full_dataset = MultiAgentTrajectoryDataset(data_file, kwargs["sequence_len"])
