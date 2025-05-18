@@ -93,7 +93,8 @@ def load_data_and_data_loaders(dataset, batch_size, **kwargs):
 
     elif dataset == 'MINIGRID':
         # data_file = "data/minigrid/nored-lrf-mapupdate-penalty0.005.hdf5"
-        data_file = "data/minigrid/4-rooms-small/6agents.hdf5" # 50k steps per agent version
+        # data_file = "data/minigrid/4-rooms-small/6agents.hdf5" # 50k steps per agent version
+        data_file = "data/minigrid/4-rooms-2.5k-color/6agents.hdf5" # 2.5k per agent, color wall observations
         # data_file = "data/minigrid/4-rooms-1k/combined.hdf5" # 1k trajectories per agent version
         # full_dataset = TrajectoryDataset(data_file)
         full_dataset = MultiAgentTrajectoryDataset(data_file, kwargs["sequence_len"])
@@ -109,8 +110,8 @@ def load_data_and_data_loaders(dataset, batch_size, **kwargs):
         if kwargs["balanced_sampling"]:
             train_agent_to_data_idx = get_agent_to_indices(training_data)
             valid_agent_to_data_idx = get_agent_to_indices(validation_data)
-            train_sampler = BalancedAgentSampler(train_agent_to_data_idx)
-            valid_sampler = BalancedAgentSampler(valid_agent_to_data_idx)
+            train_sampler = BalancedAgentSampler(agent_to_indices=train_agent_to_data_idx)
+            valid_sampler = BalancedAgentSampler(agent_to_indices=valid_agent_to_data_idx)
             training_loader, validation_loader = multiagent_traj_data_loaders(
                 training_data, validation_data, batch_size, 
                 train_sampler=train_sampler, valid_sampler=valid_sampler,

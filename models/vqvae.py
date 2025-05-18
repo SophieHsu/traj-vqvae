@@ -178,13 +178,14 @@ class RNNVQVAE(nn.Module):
         mask = x["mask"]
         future_mask = x["future_mask"]
 
-        # get embedding corresponding to the last non-masked timestep for each trajectory
+        # get timestep-wise continuous embedding
         z_e = self.encoder(traj, mask)
+        # # get embedding corresponding to the last non-masked timestep for each trajectory
         # last_real_index = mask.shape[1] - 1 - torch.argmax(torch.flip(mask, dims=[1]), axis=1)
         # z_e = z_e[torch.arange(z_e.shape[0]), last_real_index]
         # pass through VQ layer
-        embedding_loss, z_q, perplexity, _, _ = self.vector_quantization(z_e, mask)
-        
+        embedding_loss, z_q, perplexity, min_encodings, min_encoding_indices = self.vector_quantization(z_e, mask)
+
         # predict past and future
         # target_actions = future_actions[:,:self.decoder.n_steps]
         target_actions = torch.cat((actions, future_actions[:,:self.decoder.n_future_steps]), dim=1)
@@ -208,7 +209,7 @@ class RNNVQVAE(nn.Module):
             print("prediction loss is nan. do masked_targets and logits look okay?")
             breakpoint()
 
-        return logits, embedding_loss, pred_loss
+        return logits, embedding_loss, pred_loss, min_encodings, min_encoding_indices
     
     def get_embeddings(self, x):
         """
