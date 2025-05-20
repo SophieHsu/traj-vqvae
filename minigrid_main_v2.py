@@ -512,7 +512,10 @@ def main(args):
     # Load data
     print("Loading data...")
     training_data, validation_data, train_loader, val_loader, x_train_var = load_data_and_data_loaders(
-        dataset='MINIGRID', batch_size=args.batch_size, sequence_len=args.input_seq_len, balanced_sampling=args.balanced_sampling)
+        dataset='MINIGRID', batch_size=args.batch_size, 
+        sequence_len=args.input_seq_len, balanced_sampling=args.balanced_sampling,
+        data_file=args.data_file,
+    )
 
     # Initialize model
     model = RNNVQVAE(
@@ -564,6 +567,7 @@ class Args:
     save_interval: int = 50 # number of epochs between each checkpoint saving
 
     """Dataset Settings"""
+    data_file: str = "data/minigrid/9-rooms-2.5k/6agents.hdf5"
     input_seq_len: int = 30 # number of past steps to feed into encoder
     balanced_sampling: bool = True # if True, sample approximately equally from each agent
     
