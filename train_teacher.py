@@ -200,7 +200,6 @@ def train_teacher(model, train_loader, val_loader, num_epochs, learning_rate, de
 
             sampled_agents.append(agent_id)
 
-        breakpoint()
         train_avg_loss = total_train_loss / train_total
         train_accuracy = correct / train_total 
         # print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_avg_loss:.4f} | Acc: {train_accuracy:.4f}%")
