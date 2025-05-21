@@ -53,7 +53,7 @@ class TrajectoryLatentDataset(Dataset):
                     "z_e": np.array(traj_data["z_e"]).astype(np.float32),
                     "z_q": np.array(traj_data["z_q"]).astype(np.float32),
                     "mask": np.array(traj_data["mask"]).astype(np.float32),
-                    "agent_id": np.array(traj_data["agent_id"]).astype(np.int64),
+                    "agent_id": traj_data["agent_id"][:].item(),
                     "action": np.array(traj_data["action"]).astype(np.int64),
                     "vis_wall_collision_hist": np.array(traj_data["vis_wall_collision_hist"]).astype(np.int64),
                     "invis_wall_collision_hist": np.array(traj_data["invis_wall_collision_hist"]).astype(np.int64),

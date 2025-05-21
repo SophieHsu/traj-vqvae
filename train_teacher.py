@@ -2,7 +2,7 @@
 from models.vqvae import RNNVQVAE
 from models.teacher import MaskedMeanClassifier, FinalStepClassifier
 from load_traj import TrajectoryLatentDataset, MultiAgentTrajectoryDataset, trajectory_latent_collate_fn
-from human_knowledge_utils import misclassification_validity_check
+from human_knowledge_utils import misclassification_validity_check, BalancedAgentSampler, get_agent_to_indices
 
 import torch
 from torch.utils.data import DataLoader, random_split
@@ -28,19 +28,12 @@ TEACHER_MODELS = {
 
 @dataclass
 class Args:
-    """Trained VQVAE model"""
+    """Dataset Setting"""
     model_dir: str = None # directory the model checkpoint and config yaml are stored
-    # model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/4R1k_30past_10future_cb512_balanced_1000" # one trained with balaned sampler
-    # model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/4R_30past_10future_cb512_1000epochs" # one trained with balaned sampler
-
     checkpoint_file: str = None # name of vqvae checkpoint file inside model_dir
-    # checkpoint_file: str = "checkpoint_epoch_999.pt"
-
     raw_data_path: str = None # raw trajectory data path used to generate new dataset if data_path is not provided. ignored if data_path is provided
-    # raw_data_path: str = "/home/ayanoh/traj-vqvae/data/minigrid/4-rooms-1k/combined.hdf5" 
-    
     data_path: str = None
-    # data_path: str = "/home/ayanoh/traj-vqvae/data/teacher/minigrid/4-rooms-1k/4R_30past_10future_cb512_1000epochs/combined.hdf5" # path to teacher training dataset
+    balanced_sampling: bool = True
 
     """Torch, cuda, seed"""
     exp_name: str = "masked_mean_classifier"
@@ -184,10 +177,11 @@ def train_teacher(model, train_loader, val_loader, num_epochs, learning_rate, de
         """
         TRAINING
         """
+        sampled_agents = []
         for batch in train_loader:
             z_q = batch["z_q"].to(device)
             mask = batch["mask"].to(device)
-            agent_id = batch["agent_id"].to(device).squeeze(1)
+            agent_id = batch["agent_id"].to(device)
             actions.append(batch["action"])
             invis_collision_hist.append(batch["invis_wall_collision_hist"])
 
@@ -204,6 +198,9 @@ def train_teacher(model, train_loader, val_loader, num_epochs, learning_rate, de
             correct += (preds == agent_id).sum().item()
             train_total += agent_id.shape[0]
 
+            sampled_agents.append(agent_id)
+
+        breakpoint()
         train_avg_loss = total_train_loss / train_total
         train_accuracy = correct / train_total 
         # print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_avg_loss:.4f} | Acc: {train_accuracy:.4f}%")
@@ -228,7 +225,7 @@ def train_teacher(model, train_loader, val_loader, num_epochs, learning_rate, de
             for batch in val_loader:
                 z_q = batch["z_q"].to(device)
                 mask = batch["mask"].to(device)
-                agent_id = batch["agent_id"].to(device).squeeze(1)
+                agent_id = batch["agent_id"].to(device)
                 actions.append(batch["action"])
                 invis_collision_hist.append(batch["invis_wall_collision_hist"])
 
@@ -313,21 +310,40 @@ def main(args):
         checkpoint_file=args.checkpoint_file,
         data_path=args.data_path,
     )
-    # breakpoint()
-    train_loader = DataLoader(
-        train_data,
-        batch_size=args.batch_size,
-        shuffle=True,
-        pin_memory=True,
-        collate_fn=trajectory_latent_collate_fn,
-    )
-    val_loader = DataLoader(
-        val_data,
-        batch_size=args.batch_size,
-        shuffle=True,
-        pin_memory=True,
-        collate_fn=trajectory_latent_collate_fn,
-    )
+    if args.balanced_sampling:
+        train_agent_to_data_idx = get_agent_to_indices(train_data)
+        valid_agent_to_data_idx = get_agent_to_indices(val_data)
+        train_sampler = BalancedAgentSampler(agent_to_indices=train_agent_to_data_idx)
+        valid_sampler = BalancedAgentSampler(agent_to_indices=valid_agent_to_data_idx)
+        train_loader = DataLoader(
+            train_data,
+            batch_size=args.batch_size,
+            pin_memory=True,
+            collate_fn=trajectory_latent_collate_fn,
+            sampler=train_sampler,
+        )
+        val_loader = DataLoader(
+            val_data,
+            batch_size=args.batch_size,
+            pin_memory=True,
+            collate_fn=trajectory_latent_collate_fn,
+            sampler=valid_sampler,
+        )
+    else:
+        train_loader = DataLoader(
+            train_data,
+            batch_size=args.batch_size,
+            shuffle=True,
+            pin_memory=True,
+            collate_fn=trajectory_latent_collate_fn,
+        )
+        val_loader = DataLoader(
+            val_data,
+            batch_size=args.batch_size,
+            shuffle=True,
+            pin_memory=True,
+            collate_fn=trajectory_latent_collate_fn,
+        )
     print("Dataloaders ready")
 
     # initialize model
