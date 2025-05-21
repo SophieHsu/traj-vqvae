@@ -6,44 +6,53 @@ import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class MultiCodebookVectorQuantizer(nn.Module):
-    def __init__(self, n_e, e_dim, beta):
+"""
+Differentiable Gumbel Softmax Quantizers
+"""
+class GumbelQuantizer(nn.Module):
+    def __init__(self, num_latents, e_dim, temperature=1.0, straight_through=True):
         super().__init__()
-        self.n_e = n_e
-        self.e_dim = e_dim
-        self.beta = beta
-        self.embedding = nn.Embedding(n_e, e_dim)
-        self.embedding.weight.data.uniform_(-1.0 / n_e, 1.0 / n_e)
+        self.num_latents = num_latents  # Number of categories per timestep
+        self.e_dim = e_dim    # Dimensionality of each categorical vector
+        self.temperature = temperature
+        self.straight_through = straight_through
 
-    def forward(self, z):  # z: [B, k, D]
-        B, k, D = z.shape
-        z_flat = z.reshape(-1, D)  # [B*k, D]
+        # A projection from encoder output to Gumbel logits
+        self.logit_proj = nn.Linear(e_dim, num_latents)
 
-        # Compute distances
-        d = (z_flat ** 2).sum(dim=1, keepdim=True) + \
-            (self.embedding.weight ** 2).sum(dim=1) - \
-            2 * torch.matmul(z_flat, self.embedding.weight.t())  # [B*k, n_e]
+    def forward(self, z_e, mask=None):
+        """
+        z_e: (B, T, D) - continuous encoder outputs
+        mask: (B, T) - optional binary mask
+        """
+        B, T, D = z_e.shape
+        logits = self.logit_proj(z_e)  # (B, T, num_latents)
+        gumbel_softmax = F.gumbel_softmax(
+            logits, tau=self.temperature, hard=self.straight_through, dim=-1
+        )  # (B, T, num_latents)
 
-        indices = torch.argmin(d, dim=1)  # [B*k]
-        z_q = self.embedding(indices).view(B, k, D)  # [B, k, D]
+        # Optional projection to latent_dim
+        z_q = gumbel_softmax  # Can also add a linear projection here if needed
 
-        # Loss
-        z_reshaped = z.view(B * k, D)
-        z_q_reshaped = z_q.view(B * k, D)
-        commitment_loss = self.beta * F.mse_loss(z_reshaped, z_q_reshaped.detach())
-        codebook_loss = F.mse_loss(z_reshaped.detach(), z_q_reshaped)
-        loss = commitment_loss + codebook_loss
+        loss = torch.tensor(0.0, device=z_e.device) 
+        perplexity = self.compute_perplexity(gumbel_softmax, mask)
 
-        # Straight-through estimator
-        z_q = z + (z_q - z).detach()
+        return loss, z_q, perplexity, gumbel_softmax, torch.argmax(gumbel_softmax, dim=-1)
 
-        # Perplexity
-        one_hot = F.one_hot(indices, self.n_e).float()
-        avg_probs = one_hot.mean(dim=0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+    def compute_perplexity(self, probs, mask=None):
+        """
+        probs: (B, T, num_latents)
+        mask: (B, T)
+        """
+        avg_probs = probs.mean(dim=(0, 1)) if mask is None else (probs * mask.unsqueeze(-1)).sum(dim=(0, 1)) / (mask.sum() + 1e-6)
+        entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-10))
+        perplexity = torch.exp(entropy)
+        return perplexity
 
-        return loss, z_q, perplexity, indices.view(B, k)
 
+"""
+Hard Vector Quantizers
+"""
 class VectorQuantizer(nn.Module):
     """
     Discretization bottleneck part of the VQ-VAE.
@@ -162,7 +171,43 @@ class VectorQuantizer(nn.Module):
 
         return loss, z_q, perplexity, min_encodings, min_encoding_indices
 
+class MultiCodebookVectorQuantizer(nn.Module):
+    def __init__(self, n_e, e_dim, beta):
+        super().__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        self.beta = beta
+        self.embedding = nn.Embedding(n_e, e_dim)
+        self.embedding.weight.data.uniform_(-1.0 / n_e, 1.0 / n_e)
 
+    def forward(self, z):  # z: [B, k, D]
+        B, k, D = z.shape
+        z_flat = z.reshape(-1, D)  # [B*k, D]
+
+        # Compute distances
+        d = (z_flat ** 2).sum(dim=1, keepdim=True) + \
+            (self.embedding.weight ** 2).sum(dim=1) - \
+            2 * torch.matmul(z_flat, self.embedding.weight.t())  # [B*k, n_e]
+
+        indices = torch.argmin(d, dim=1)  # [B*k]
+        z_q = self.embedding(indices).view(B, k, D)  # [B, k, D]
+
+        # Loss
+        z_reshaped = z.view(B * k, D)
+        z_q_reshaped = z_q.view(B * k, D)
+        commitment_loss = self.beta * F.mse_loss(z_reshaped, z_q_reshaped.detach())
+        codebook_loss = F.mse_loss(z_reshaped.detach(), z_q_reshaped)
+        loss = commitment_loss + codebook_loss
+
+        # Straight-through estimator
+        z_q = z + (z_q - z).detach()
+
+        # Perplexity
+        one_hot = F.one_hot(indices, self.n_e).float()
+        avg_probs = one_hot.mean(dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        return loss, z_q, perplexity, indices.view(B, k)
 
 class TrajlevelVectorQuantizer(nn.Module):
     """

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from enum import Enum
 from models.encoder import Encoder, RNNEncoder, SegmentRNNEncoder
-from models.quantizer import VectorQuantizer, MultiCodebookVectorQuantizer
+from models.quantizer import VectorQuantizer, MultiCodebookVectorQuantizer, GumbelQuantizer
 from models.decoder import Decoder, TransformerActionPredictor, MultiCodeTransformerActionPredictor, TransformerFutureActionPredictor
 
 class PredictionTypes(Enum):
@@ -13,6 +13,126 @@ class PredictionTypes(Enum):
     """
     FUTURE = 0 # predict future steps only
     PAST_FUTURE = 1 # predict past and future steps
+
+"""
+Gumbel Softmax Models
+"""
+class GumbelCodebookFreeVAE(nn.Module):
+    def __init__(
+        self, in_dim, state_dim,
+        h_dim, 
+        n_embeddings, bidirectional, 
+        temperature,
+        n_actions, n_past_steps, n_future_steps,
+        decoder_context_dim,
+        n_attention_heads,
+        n_decoder_layers,
+        save_img_embedding_map=False,
+    ):
+        super().__init__()
+        self.prediction_type = PredictionTypes.PAST_FUTURE
+        self.n_past_steps = n_past_steps
+        self.n_future_steps = n_future_steps
+        
+        self.n_actions = n_actions
+        # encode into continuous latent space
+        self.encoder = RNNEncoder(in_dim=in_dim, h_dim=h_dim, num_layers=1, bidirectional=True)
+        # pass continuous latent vector through discretization bottleneck
+        embedding_dim = h_dim * 2 if bidirectional else h_dim
+        
+        # quantizer to discretize embedding
+        self.quantizer = GumbelQuantizer(
+            num_latents=n_embeddings,
+            e_dim=embedding_dim,
+            temperature=temperature,
+        )
+
+        # decode the discrete latent representation
+        self.decoder = TransformerActionPredictor(
+            # embedding_dim=embedding_dim, # dimension of z_q
+            embedding_dim=n_embeddings, # dimension of z_q
+            state_dim=state_dim, # input state dimension (s, a, r)
+            num_actions=n_actions,
+            n_future_steps=n_future_steps,
+            n_past_steps=n_past_steps,
+            d_model=decoder_context_dim,
+            nhead=n_attention_heads,
+            num_layers=n_decoder_layers,
+        )
+
+        if save_img_embedding_map:
+            self.img_to_embedding_map = {i: [] for i in range(n_embeddings)}
+        else:
+            self.img_to_embedding_map = None
+
+    def forward(self, x):
+        """
+        x = {
+            "traj" : [B, T, d_feature], # train data
+            "future_traj" : [B, T_max, d_feature] # rest of trajectory after "traj"
+            "mask" : [B, T],
+            "future_mask: :
+        }
+        """
+        traj = x["traj"]
+        next_state = x["next_state"]
+        actions = x["actions"]
+        future_actions = x["future_actions"]
+        mask = x["mask"]
+        future_mask = x["future_mask"]
+
+        # get timestep-wise continuous embedding
+        z_e = self.encoder(traj, mask)
+
+        # pass through VQ layer
+        embedding_loss, z_q, perplexity, min_encodings, min_encoding_indices = self.quantizer(z_e, mask)
+
+        # predict past and future
+        target_actions = torch.cat((actions, future_actions[:,:self.decoder.n_future_steps]), dim=1)
+        logits = self.decoder(z_q, next_state, target_actions)
+
+        # compute CE loss, masking out effects from timesteps where ground truth prediction target does not exist
+        target_mask = torch.cat([mask, future_mask[:,:self.decoder.n_future_steps]], dim=1)
+        masked_targets = target_actions.clone() # masking padded timesteps
+        masked_targets[target_mask == 0] = -100  # index to ignore
+        
+        # check for case where all target actions are masked out
+        if (masked_targets != -100).sum() == 0:
+            pred_loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
+        else:
+            pred_loss = F.cross_entropy(
+                logits.reshape(-1, self.n_actions),
+                masked_targets.reshape(-1),
+                ignore_index=-100,
+            )
+        if np.isnan(pred_loss.item()):
+            print("prediction loss is nan. do masked_targets and logits look okay?")
+            breakpoint()
+
+        return logits, embedding_loss, pred_loss, min_encodings, min_encoding_indices
+    
+    def get_embeddings(self, x):
+        """
+        x = {
+            "traj" : [B, T, d_feature], # train data
+            "mask" : [B, T],
+        }
+        """
+        traj = x["traj"]
+        mask = x["mask"]
+
+        # get embedding corresponding to the last non-masked timestep for each trajectory
+        z_e = self.encoder(traj, mask)
+
+        # pass through VQ layer
+        embedding_loss, z_q, perplexity, min_encodings, min_encoding_indices = self.vector_quantization(z_e, mask)
+        return z_e, z_q, min_encodings, min_encoding_indices
+
+
+
+"""
+VQ Models
+"""
 
 """Predict only the future n actions"""
 class RNNFutureVQVAE(nn.Module):
