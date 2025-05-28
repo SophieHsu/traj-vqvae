@@ -1,5 +1,5 @@
 
-from models.vqvae import RNNVQVAE
+from models.vqvae import RNNVQVAE, GumbelCodebookFreeVAE
 from models.teacher import MaskedMeanClassifier, FinalStepClassifier
 from load_traj import TrajectoryLatentDataset, MultiAgentTrajectoryDataset, trajectory_latent_collate_fn
 from human_knowledge_utils import misclassification_validity_check, BalancedAgentSampler, get_agent_to_indices
@@ -26,12 +26,18 @@ TEACHER_MODELS = {
     "FinalStepClassifier": FinalStepClassifier,
 }
 
+VAE_MODELS = {
+    "RNNVQVAE": RNNVQVAE,
+    "GumbelCodebookFreeVAE": GumbelCodebookFreeVAE,
+}
+
 @dataclass
 class Args:
     """Dataset Setting"""
     model_dir: str = None # directory the model checkpoint and config yaml are stored
     checkpoint_file: str = None # name of vqvae checkpoint file inside model_dir
     raw_data_path: str = None # raw trajectory data path used to generate new dataset if data_path is not provided. ignored if data_path is provided
+    vae_type: str = None
     data_path: str = None
     balanced_sampling: bool = True
 
@@ -81,11 +87,12 @@ def prepare_data(raw_data_path=None, model_dir=None, checkpoint_file=None, data_
         with open(model_config_path, 'r') as f:
             model_config = yaml.load(f, Loader=yaml.SafeLoader)
         # get all model arguments
-        model_input_keys = list(inspect.signature(RNNVQVAE.__init__).parameters.keys())
+        vae_class = VAE_MODELS[args.vae_type]
+        model_input_keys = list(inspect.signature(vae_class.__init__).parameters.keys())
         model_input_keys.remove('self')
         model_kwargs = {key: model_config[key]["value"] for key in model_input_keys if key in model_config}
         model_kwargs["n_past_steps"] = model_config["input_seq_len"]["value"]
-        vqvae_model = RNNVQVAE(**model_kwargs)
+        vqvae_model = vae_class(**model_kwargs)
         vqvae_model.load_state_dict(torch.load(model_path, weights_only=True))
         print(vqvae_model)
 

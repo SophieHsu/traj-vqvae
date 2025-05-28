@@ -22,7 +22,7 @@ class GumbelCodebookFreeVAE(nn.Module):
         self, in_dim, state_dim,
         h_dim, 
         n_embeddings, bidirectional, 
-        temperature,
+        gumbel_temperature,
         n_actions, n_past_steps, n_future_steps,
         decoder_context_dim,
         n_attention_heads,
@@ -44,7 +44,7 @@ class GumbelCodebookFreeVAE(nn.Module):
         self.quantizer = GumbelQuantizer(
             num_latents=n_embeddings,
             e_dim=embedding_dim,
-            temperature=temperature,
+            temperature=gumbel_temperature,
         )
 
         # decode the discrete latent representation
@@ -125,7 +125,7 @@ class GumbelCodebookFreeVAE(nn.Module):
         z_e = self.encoder(traj, mask)
 
         # pass through VQ layer
-        embedding_loss, z_q, perplexity, min_encodings, min_encoding_indices = self.vector_quantization(z_e, mask)
+        embedding_loss, z_q, perplexity, min_encodings, min_encoding_indices = self.quantizer(z_e, mask)
         return z_e, z_q, min_encodings, min_encoding_indices
 
 

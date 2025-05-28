@@ -524,7 +524,7 @@ def main(args):
         h_dim=args.h_dim,
         n_embeddings=args.n_embeddings,
         bidirectional=args.bidirectional,
-        temperature=args.gumbel_temperature,
+        gumbel_temperature=args.gumbel_temperature,
         n_actions=args.n_actions,
         n_past_steps=args.input_seq_len,
         n_future_steps=args.n_future_steps,
