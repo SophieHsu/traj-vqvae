@@ -399,7 +399,8 @@ def take_step(agent, envs, action_enum, obs_type, next_obs, next_done, next_lstm
     return next_obs, remapped_actions, reward, next_done, next_lstm_state, infos
 
 def rollout_students_and_get_dist_to_goal(
-    envs, 
+    teacher_env_states,
+    rollout_envs, 
     student_agents,
     student_action_enums,
     student_obs_types, 
@@ -408,51 +409,46 @@ def rollout_students_and_get_dist_to_goal(
     device,
 ):
     # NOTE / TODO - assumes (1) the episode has not terminated when this function is called (2) there is one environment
+    
+    rollout_envs.reset()
     """
     Rolls out student agents in the environment for n_rollout_steps steps
     """
-    # save the initial environment state
-    env_start_state = envs.envs[0].unwrapped.get_internal_state()
+    n_students = len(student_agents)
+    n_steps_taken = np.zeros(n_students, dtype=int)
+    done = torch.zeros(n_students).to(device)
+    lstm_states = [initial_student_lstm_state for _ in range(n_students)]
 
-    n_grids_to_goal = {}
-    n_steps_taken = {} # keeps track of number of steps taken (< n_rollout_steps if goal is reached early)
-    
-    # rollout each student
-    for student_id in student_agents.keys():
-        
-        next_done = torch.zeros(1).to(device)
-        student_agent = student_agents[student_id]
-        next_student_lstm_state = initial_student_lstm_state
+    # Restore it into all rollout environments
+    for i, env in enumerate(rollout_envs.envs):
+        env.unwrapped.load_internal_state(teacher_env_states)
+        env.unwrapped.set_obs_type(student_obs_types[i])  # important for student perspective
 
-        # set environment's observation type to the student's typen and get initial observation
-        envs.envs[0].unwrapped.set_obs_type(student_obs_types[student_id])
-        next_student_obs = envs.envs[0].unwrapped.gen_obs()
-        next_student_obs = torch.tensor(next_student_obs, dtype=torch.float32).to(device)
+    obs = np.stack([env.unwrapped.gen_obs() for env in rollout_envs.envs])
+    obs = torch.tensor(obs, dtype=torch.float32).to(device)
 
-        n_steps = 0
-        for i in range(n_rollout_steps):
-            next_student_obs, student_actions, student_reward, next_done, next_student_lstm_state, student_infos = take_step(
-                agent=student_agent,
-                envs=envs,
-                action_enum=student_action_enums[student_id],
-                obs_type=student_obs_types[student_id],
-                next_obs=next_student_obs,
-                next_done=next_done,
-                next_lstm_state=next_student_lstm_state,
-                device=device,
-            )
-            n_steps += 1
-            if next_done:
-                break
-        
-        # once student took specified number of steps, get distance to goal
-        n_grids_to_goal[student_id] = envs.envs[0].unwrapped.compute_n_grids_to_goal()
-        n_steps_taken[student_id] = n_steps
+    for step in range(n_rollout_steps):
+        actions = []
+        for i in range(n_students):
+            student = student_agents[i]
+            action, _, _, _, lstm_state = student.get_action_and_value(
+                obs[i].unsqueeze(0), lstm_states[i], done[i].unsqueeze(0))
+            lstm_states[i] = lstm_state
+            action_enum = student_action_enums[i]
+            env_action_enum = rollout_envs.envs[i].unwrapped.actions
+            action_name = action_enum(action.item()).name
+            actions.append(env_action_enum[action_name].value)
+            n_steps_taken[i] += 1
 
-        # get the environment back to the original state
-        envs.envs[0].unwrapped.load_internal_state(env_start_state)
+        obs_, _, terminations, truncations, _ = rollout_envs.step(np.array(actions))
+        done = torch.tensor(np.logical_or(terminations, truncations), dtype=torch.float32).to(device)
+        obs = torch.tensor(obs_, dtype=torch.float32).to(device)
+        if done.all():
+            break
 
-    return n_grids_to_goal, n_steps_taken
+    # compute final distances
+    dists = np.array([env.unwrapped.compute_n_grids_to_goal() for env in rollout_envs.envs])
+    return dict(enumerate(dists)), dict(enumerate(n_steps_taken))
 
 def compute_voi_reward(
     student_knowledges, 
@@ -600,6 +596,27 @@ def main(args):
     print("#"*50, " Done loading representation VQVAE model ", "#"*50)
 
     """
+    Create environments used for student rollouts during VoI computation
+    """
+    rollout_envs = gym.vector.SyncVectorEnv([
+        make_env(
+            env_configs["env_id"],
+            idx=i,
+            capture_video=False,
+            run_name="rollout_env",
+            max_steps=env_configs["max_steps"],
+            action_type=env_configs["action_type"],
+            unexpected_state_penalty=env_configs["unexpected_state_penalty"],
+            n_frame_stacks=env_configs["n_frame_stacks"],
+            update_state=env_configs["update_state"],
+            shaped_reward=env_configs["shaped_reward"],
+            reward_modes=env_configs["reward_modes"],
+        ) for i in range(len(student_models))
+    ])
+    rollout_envs.reset(seed=args.seed)
+
+
+    """
     Set Up Logging
     """
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -702,6 +719,10 @@ def main(args):
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        # keep track of teacher performance per episode
+        episode_teacher_reward = 0
+        episode_n_redundant_disclosures = 0
+
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             """
@@ -771,7 +792,8 @@ def main(args):
             """
             # roll out the student before and after teacher action and get the distance to goal afterwards
             dist_to_goal, n_steps_completed = rollout_students_and_get_dist_to_goal(
-                envs=envs,
+                teacher_env_states=envs.envs[0].unwrapped.get_internal_state(),
+                rollout_envs=rollout_envs,
                 student_agents=student_models,
                 student_action_enums=student_action_enums,
                 student_obs_types=student_obs_types,
@@ -796,19 +818,30 @@ def main(args):
                 teacher_action=teacher_action,
                 student_type_belief=student_type_belief,
             )
-            teacher_rewards[step] = reward_voi.item()         
+            teacher_rewards[step] = reward_voi.item()
+            episode_teacher_reward += reward_voi.item()
+            redundant = (
+                teacher_action != TeacherActions.do_nothing and
+                student_knowledges[student_id][teacher_action.item()] == 1
+            )
+            episode_n_redundant_disclosures += int(redundant)
 
             """
-            Log teacher and student performances
+            Log teacher and student performances at the end of episode
             """
-            writer.add_scalar("charts/voi_reward", reward_voi)
-            writer.add_scalar("charts/disclosed_redundant", (student_id == new_student_id) and teacher_action != TeacherActions.do_nothing)
             if "final_info" in student_infos:
-                for info in student_infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                final_student_info = student_infos["final_info"][0]
+                episode_len = final_student_info["episode"]["l"]
+                # student performance
+                writer.add_scalar("charts/student_episodic_reward", final_student_info["episode"]["r"])
+                writer.add_scalar("charts/student_episodic_length", final_student_info["episode"]["l"])
+                # teacher performance
+                writer.add_scalar("charts/episodic_voi_reward", episode_teacher_reward, global_step)
+                writer.add_scalar("charts/episodic_redundant_rate", episode_n_redundant_disclosures / episode_len)
+                writer.add_scalar("charts/episodic_redundant_count", episode_n_redundant_disclosures)
+
+                episode_teacher_reward = 0
+                episode_n_redundant_disclosures = 0
 
             student_id = new_student_id
 
