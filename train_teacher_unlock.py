@@ -1,7 +1,7 @@
 
 from models.vqvae import RNNVQVAE, GumbelCodebookFreeVAE
 from load_traj import TrajectoryLatentDataset, MultiAgentTrajectoryDataset, trajectory_latent_collate_fn
-from human_knowledge_utils import misclassification_validity_check, BalancedAgentSampler, get_agent_to_indices
+from human_knowledge_utils import BalancedAgentSampler
 from datasets.prepare_minigrid_dataset import AGENTS, get_agent_id
 
 import torch
@@ -40,17 +40,27 @@ class Knowledge(IntEnum):
     act_right = 2
     act_forward = 3
 
+class TeacherActions(IntEnum):
+    """
+    What teacher actions reveal
+    """
+    obs_red_wall = Knowledge.obs_red_wall
+    act_left = Knowledge.act_left
+    act_right = Knowledge.act_right
+    act_forward = Knowledge.act_forward
+    do_nothing = len(Knowledge)
+
 @dataclass
 class Args:
     """Torch, cuda, seed"""
-    exp_name: str = "masked_mean_classifier"
+    exp_name: str = "teacher_unlock_test"
     seed: int = 1 # NOTE 
     torch_deterministic: bool = True
     cuda: bool = True
     
     """Logging"""
     track: bool = False
-    wandb_project_name: str = "human-knowledge-teacher"
+    wandb_project_name: str = "human-knowledge-teacher-unlock"
     wandb_entity: str = "ahiranak-university-of-southern-california"
     save_interval: int = 100 # number of epochs between each checkpoint saving
 
@@ -64,15 +74,13 @@ class Args:
     """Teacher Model Settings"""
     hidden_dim: int = 256
     n_student_types: int = 6
-    # teacher_actions: Tuple[str, ...] = ("t_left", "t_right", "t_forward", "t_nothing")
-    n_teacher_actions: int = 4
+    n_teacher_actions: int = 5
     lstm_size: int = 128
     use_belief_head: bool = True
 
     """Training Hyperparams"""
     num_epochs: int = 5000
-    batch_size: int = 32
-    learning_rate: float = 1e-4
+    n_rollout_steps_for_voi_computation: int = 4 # in current setup, agent can move at least one grid in 4 steps
 
     """Algorithm specific arguments"""
     total_timesteps: int = int(1e9)
@@ -82,7 +90,7 @@ class Args:
     anneal_lr: bool = True
     gamma: float = 0.99
     gae_lambda: float = 0.95 # the lambda for the general advantage estimation
-    num_minibatches: int = 4
+    num_minibatches: int = 1
     update_epochs: int = 4 # the K epochs to update the policy
     norm_adv: bool = True # Toggles advantages normalization
     clip_coef: float = 0.1 # the surrogate clipping coefficient
@@ -99,7 +107,6 @@ class Args:
     """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
-
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -179,6 +186,7 @@ class TeacherAgent(nn.Module):
         self.hidden_dim = hidden_dim
         self.use_belief_head = belief_head
         self.n_student_types = n_student_types
+        self.action_dim = action_dim
 
         self.network = nn.Sequential(
             layer_init(nn.Linear(self.input_dim, self.hidden_dim)),
@@ -244,6 +252,13 @@ class TeacherAgent(nn.Module):
             action = probs.sample()
 
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), lstm_state
+    
+    def get_belief(self, x, lstm_state, done):
+        assert self.use_belief_head, "belief head does not exist"
+        hidden, _ = self.get_states(x, lstm_state, done)
+        belief_logits = self.belief_head(hidden)
+        belief_dist = torch.softmax(belief_logits, dim=-1)
+        return belief_dist
 
 def load_student_configs(student_model_dir):
     """
@@ -383,9 +398,113 @@ def take_step(agent, envs, action_enum, obs_type, next_obs, next_done, next_lstm
 
     return next_obs, remapped_actions, reward, next_done, next_lstm_state, infos
 
+def rollout_students_and_get_dist_to_goal(
+    envs, 
+    student_agents,
+    student_action_enums,
+    student_obs_types, 
+    initial_student_lstm_state,
+    n_rollout_steps, 
+    device,
+):
+    # NOTE / TODO - assumes (1) the episode has not terminated when this function is called (2) there is one environment
+    """
+    Rolls out student agents in the environment for n_rollout_steps steps
+    """
+    # save the initial environment state
+    env_start_state = envs.envs[0].unwrapped.get_internal_state()
+
+    n_grids_to_goal = {}
+    n_steps_taken = {} # keeps track of number of steps taken (< n_rollout_steps if goal is reached early)
+    
+    # rollout each student
+    for student_id in student_agents.keys():
+        
+        next_done = torch.zeros(1).to(device)
+        student_agent = student_agents[student_id]
+        next_student_lstm_state = initial_student_lstm_state
+
+        # set environment's observation type to the student's typen and get initial observation
+        envs.envs[0].unwrapped.set_obs_type(student_obs_types[student_id])
+        next_student_obs = envs.envs[0].unwrapped.gen_obs()
+        next_student_obs = torch.tensor(next_student_obs, dtype=torch.float32).to(device)
+
+        n_steps = 0
+        for i in range(n_rollout_steps):
+            next_student_obs, student_actions, student_reward, next_done, next_student_lstm_state, student_infos = take_step(
+                agent=student_agent,
+                envs=envs,
+                action_enum=student_action_enums[student_id],
+                obs_type=student_obs_types[student_id],
+                next_obs=next_student_obs,
+                next_done=next_done,
+                next_lstm_state=next_student_lstm_state,
+                device=device,
+            )
+            n_steps += 1
+            if next_done:
+                break
+        
+        # once student took specified number of steps, get distance to goal
+        n_grids_to_goal[student_id] = envs.envs[0].unwrapped.compute_n_grids_to_goal()
+        n_steps_taken[student_id] = n_steps
+
+        # get the environment back to the original state
+        envs.envs[0].unwrapped.load_internal_state(env_start_state)
+
+    return n_grids_to_goal, n_steps_taken
+
+def compute_voi_reward(
+    student_knowledges, 
+    student_knowledge_to_id, 
+    utilities, 
+    teacher_action, 
+    student_type_belief,
+):
+    """
+    TODO - probably should be vectorized
+
+    Compute VoI reward as:
+        sum_S( P(S) * P(S'|S,a_T) * U(S') ) - sum_S( P(S) * U(S) )
+        (see notion 06/05/2025)
+    Args:
+        student_knowledges (dict) : map student ID to knowledge
+        student_knowledge_to_id (dict) : map student knowledge (tuple) to ID
+        utilities (dict) : utility of each state (where state is student ID)
+        student_type_belief (array) : belief over each student type
+    """
+    value_after_action, value_before_action = 0, 0
+
+    for student_id in student_knowledges.keys():
+        # find the student_id after teacher action
+        new_student_id = get_new_student_id(student_id, teacher_action, student_knowledges, student_knowledge_to_id)
+        
+        # get value after teacher action
+        value_after_action += student_type_belief[student_id] * utilities[new_student_id]
+
+        # get value before teacher action
+        value_before_action += student_type_belief[student_id] * utilities[student_id]
+    
+    return value_after_action - value_before_action
+
+def get_new_student_id(student_id, teacher_action, student_knowledges, student_knowledge_to_id):
+    """
+    get student ID after teacher action
+    """
+    new_knowledge = student_knowledges[student_id].copy()
+    if teacher_action.item() == TeacherActions.do_nothing:
+        # the last teacher action corresponds to "do nothing" action
+        return student_id
+    else:
+        new_knowledge[teacher_action.item()] = 1
+        new_student_id = student_knowledge_to_id[tuple(new_knowledge)]
+        return new_student_id
+
 def main(args):
 
-    assert args.n_teacher_actions == len(Knowledge), "n_teacher_actions must match the number of knowledges for now"
+    # torch.backends.cudnn.enabled = False
+
+    assert args.n_teacher_actions == len(TeacherActions), "n_teacher_actions must match the number of knowledges for now"
 
     # seeding
     random.seed(args.seed)
@@ -402,6 +521,7 @@ def main(args):
     """
     # get student checkpoint and config paths
     student_checkpoints, student_configs, student_obs_types, student_knowledges = load_student_configs(args.student_model_dir)
+    student_knowledge_to_id = {tuple(val): key for key, val in student_knowledges.items()}
 
     # get environment configs
     env_configs = get_environment_configs(student_configs)
@@ -520,17 +640,20 @@ def main(args):
     teacher_agent.to(device)
     optimizer = optim.Adam(teacher_agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
+
     """
     Storage Setup
     """
-    # ALGO Logic: Storage setup
     teacher_obs_buffer = torch.zeros((args.num_steps, teacher_agent.input_dim)).to(device)
     teacher_action_buffer = torch.zeros((args.num_steps), dtype=torch.long).to(device)
     student_traj_buffer = torch.zeros((args.num_steps, vqvae_model.in_dim)).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    student_rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    # logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    logprobs = torch.zeros((args.num_steps)).to(device)
+    # student_rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    student_rewards = torch.zeros((args.num_steps)).to(device)
+    teacher_rewards = torch.zeros(args.num_steps).to(device)
+    dones = torch.zeros((args.num_steps)).to(device)
+    values = torch.zeros((args.num_steps)).to(device)
 
     # Choose a random student
     student_id = np.random.choice(n_students)
@@ -557,12 +680,22 @@ def main(args):
         torch.zeros(teacher_agent.lstm.num_layers, args.num_envs, teacher_agent.lstm.hidden_size).to(device),
     )  # hidden and cell states (see https://youtu.be/8HyCNIVRbSU)
 
-    for iteration in range(1, args.num_iterations + 1):
+    """
+    Start main training loop
+    """
+    for iteration in tqdm(range(1, args.num_iterations + 1)):
+
         # clear out student trajectory buffer to avoid values from previous iterations affecting zq computation
         student_traj_buffer = torch.zeros((args.num_steps, vqvae_model.in_dim)).to(device)
 
-        initial_teacher_lstm_state = (next_teacher_lstm_state[0].clone(), next_teacher_lstm_state[1].clone())
-        teacher_action = 0 # TODO - revisit after defining teacher action id to knowledge
+        # initial_teacher_lstm_state = (next_teacher_lstm_state[0].clone(), next_teacher_lstm_state[1].clone())
+        initial_teacher_lstm_state = (
+            next_teacher_lstm_state[0].clone().detach(), 
+            next_teacher_lstm_state[1].clone().detach(),
+        )
+
+        teacher_action = TeacherActions.do_nothing 
+
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
@@ -571,7 +704,9 @@ def main(args):
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
-            # let student take a step in the environment
+            """
+            Step the current student
+            """
             next_student_obs, student_actions, student_reward, next_done, next_student_lstm_state, student_infos = take_step(
                 agent=student_agent,
                 envs=envs,
@@ -582,9 +717,12 @@ def main(args):
                 next_lstm_state=next_student_lstm_state,
                 device=device,
             )
-            dones[step] = next_done
-            student_rewards[step] = student_reward
+            dones[step] = next_done.item()
+            student_rewards[step] = student_reward.item()
 
+            """
+            Get teacher observation (zq, s_t, a_T)
+            """
             # encode student trajectory into zq
             # concatenate teacher state, student action, and student reward into a single step of student trajectory, add to buffer
             traj_step = torch.cat([ # 1 step of student trajectory
@@ -606,10 +744,14 @@ def main(args):
             )
 
             # concat zq, st, teacher_action -> put in teacher obs buffer
+            z_q = z_q.detach()
             zq_last_step = z_q[0,num_valid_steps-1,:].to(device) # NOTE - needs fixed if training multiple environments
-            teacher_obs = torch.cat([zq_last_step, next_teacher_obs, torch.tensor([teacher_action]).to(device)])
+            teacher_obs = torch.cat([zq_last_step, next_teacher_obs, torch.tensor([teacher_action]).to(device)]).detach()
             teacher_obs_buffer[step] = teacher_obs
 
+            """
+            Take teacher action
+            """
             # ALGO LOGIC: action logic
             with torch.no_grad():
                 teacher_action, logprob, _, value, next_teacher_lstm_state = teacher_agent.get_action_and_value(
@@ -619,13 +761,48 @@ def main(args):
                 )
                 values[step] = value.flatten()
             teacher_action_buffer[step] = teacher_action
-            logprobs[step] = logprob
+            logprobs[step] = logprob.item()
 
-            # compute teacher rewards ####### TODO - HERE!
-            # IN: envs, students, n_steps -> OUT: state, agent pos, goal pos after n_steps
-            breakpoint()
+            # find out agent type after the teacher takes action
+            new_student_id = get_new_student_id(student_id, teacher_action, student_knowledges, student_knowledge_to_id)
 
-            # TODO - log teacher performance 
+            """
+            Compute VoI reward
+            """
+            # roll out the student before and after teacher action and get the distance to goal afterwards
+            dist_to_goal, n_steps_completed = rollout_students_and_get_dist_to_goal(
+                envs=envs,
+                student_agents=student_models,
+                student_action_enums=student_action_enums,
+                student_obs_types=student_obs_types,
+                initial_student_lstm_state=next_student_lstm_state,
+                n_rollout_steps=args.n_rollout_steps_for_voi_computation,
+                device=device,
+            )
+            utilities = {id : -dist_to_goal[id] + args.n_rollout_steps_for_voi_computation - n_steps_completed[id] for id in dist_to_goal.keys()}
+            
+            # get belief over student types
+            with torch.no_grad():
+                student_type_belief = teacher_agent.get_belief(
+                    x=teacher_obs_buffer[step].unsqueeze(0),
+                    lstm_state=next_teacher_lstm_state,
+                    done=next_done,
+                )[0].detach().cpu().numpy()
+            
+            reward_voi = compute_voi_reward(
+                student_knowledges=student_knowledges,
+                student_knowledge_to_id=student_knowledge_to_id,
+                utilities=utilities,
+                teacher_action=teacher_action,
+                student_type_belief=student_type_belief,
+            )
+            teacher_rewards[step] = reward_voi.item()         
+
+            """
+            Log teacher and student performances
+            """
+            writer.add_scalar("charts/voi_reward", reward_voi)
+            writer.add_scalar("charts/disclosed_redundant", (student_id == new_student_id) and teacher_action != TeacherActions.do_nothing)
             if "final_info" in student_infos:
                 for info in student_infos["final_info"]:
                     if info and "episode" in info:
@@ -633,16 +810,16 @@ def main(args):
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
-            breakpoint()
+            student_id = new_student_id
 
         # bootstrap value if not done
         with torch.no_grad():
             next_value = teacher_agent.get_value(
-                teacher_obs,
+                teacher_obs.unsqueeze(0),
                 next_teacher_lstm_state,
                 next_done,
             ).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
+            advantages = torch.zeros_like(teacher_rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
@@ -651,14 +828,14 @@ def main(args):
                 else:
                     nextnonterminal = 1.0 - dones[t + 1]
                     nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                delta = teacher_rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
         # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_obs = teacher_obs_buffer.view(-1, teacher_obs_buffer.shape[-1])
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_actions = teacher_action_buffer.view(-1)
         b_dones = dones.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
@@ -679,7 +856,8 @@ def main(args):
 
                 _, newlogprob, entropy, newvalue, _ = teacher_agent.get_action_and_value(
                     b_obs[mb_inds],
-                    (initial_lstm_state[0][:, mbenvinds], initial_lstm_state[1][:, mbenvinds]),
+                    (initial_teacher_lstm_state[0][:, mbenvinds], initial_teacher_lstm_state[1][:, mbenvinds]),
+                    # (initial_teacher_lstm_state[0][:, mbenvinds].detach(), initial_teacher_lstm_state[1][:, mbenvinds].detach()),
                     b_dones[mb_inds],
                     b_actions.long()[mb_inds],
                 )
@@ -731,7 +909,7 @@ def main(args):
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        if args.track and iteration % 1000 == 0:
+        if args.track and (iteration % args.save_interval == 0) and iteration > 0:
             torch.save(optimizer.state_dict(), f"{wandb.run.dir}/optimizer.pt")
             torch.save(teacher_agent.state_dict(), f"{wandb.run.dir}/agent.pt")
             wandb.save(f"{wandb.run.dir}/optimizer.pt", base_path=wandb.run.dir, policy="now")
@@ -740,47 +918,3 @@ def main(args):
 if __name__ == "__main__":
     args = tyro.cli(Args)
     main(args)
-
-
-
-
-    ################ testing student rollout
-    # student_id = 1
-    # student_agent = student_models[student_id]
-    # next_obs, _ = envs.reset(seed=args.seed)
-    # next_obs = torch.Tensor(next_obs).to(device)
-    # next_done = torch.zeros(1).to(device)
-    # next_lstm_state = (
-    #     torch.zeros(student_agent.lstm.num_layers, 1, student_agent.lstm.hidden_size).to(device),
-    #     torch.zeros(student_agent.lstm.num_layers, 1, student_agent.lstm.hidden_size).to(device),
-    # )
-    # next_obs, reward, next_done, next_lstm_state = take_step(
-    #     agent=student_agent, 
-    #     envs=envs, 
-    #     action_enum=student_action_enums[student_id],
-    #     obs_type=student_obs_types[student_id],
-    #     next_obs=next_obs,
-    #     next_done=next_done,
-    #     next_lstm_state=next_lstm_state,
-    #     device=device,
-    # )
-
-    # breakpoint()
-    ################ testing student rollout
-
-    """
-    Initialize Unlocking Teacher Model
-    """
-    # teacher_model = UnlockingRNNTeacher(
-    #     zq_dim=vqvae_model.embedding_dim,
-    #     state_dim=vqvae_model_kwargs["state_dim"],
-    #     hidden_dim=args.hidden_dim,
-    #     n_student_types=args.n_student_types,
-    #     n_teacher_actions=len(args.teacher_actions),
-    # )
-    # print(teacher_model)
-    # print("#"*50, " Initialized Teacher Model ", "#"*50)
-    
-    """
-    Train Teacher
-    """
