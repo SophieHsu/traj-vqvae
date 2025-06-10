@@ -85,7 +85,7 @@ class Args:
     """Algorithm specific arguments"""
     total_timesteps: int = int(1e9)
     learning_rate: float = 2.5e-4
-    num_envs: int = 1
+    num_envs: int = 2
     num_steps: int = 128 # the number of steps to run in each environment per policy rollout
     anneal_lr: bool = True
     gamma: float = 0.99
@@ -181,7 +181,7 @@ class TeacherAgent(nn.Module):
         belief_head=True,
     ):
         super().__init__()
-        self.input_dim = zq_dim + state_dim + 1 # +1 for teacher's action history
+        self.input_dim = zq_dim + state_dim + 1  # +1 for teacher's action history
         self.lstm_size = lstm_size
         self.hidden_dim = hidden_dim
         self.use_belief_head = belief_head
@@ -204,31 +204,32 @@ class TeacherAgent(nn.Module):
             elif "weight" in name:
                 nn.init.orthogonal_(param, 1)
 
-        # belief head
         if self.use_belief_head:
             self.belief_head = layer_init(nn.Linear(self.hidden_dim, self.n_student_types))
 
-        # action head (takes hidden state and belief if used)
         policy_input_dim = self.hidden_dim + (self.n_student_types if self.use_belief_head else 0)
         self.actor = layer_init(nn.Linear(policy_input_dim, action_dim), std=0.01)
         self.critic = layer_init(nn.Linear(policy_input_dim, 1), std=1)
 
     def get_states(self, x, lstm_state, done):
-        """
-        x: shape (B, input_dim)
-        done: shape (B,)
-        lstm_state: tuple of (h, c) with shape (1, B, hidden_dim)
-        """
-        hidden = self.network(x)  # (B, lstm_size)
-        hidden = hidden.unsqueeze(0)  # (1, B, lstm_size)
-        done = done.view(1, -1, 1)  # (1, B, 1)
+        hidden = self.network(x)
 
-        # Reset hidden state if done
-        h_in = (1.0 - done) * lstm_state[0]
-        c_in = (1.0 - done) * lstm_state[1]
-        out, lstm_state = self.lstm(hidden, (h_in, c_in))
-        out = out.squeeze(0)  # (B, hidden_dim)
-        return out, lstm_state
+        # LSTM logic
+        batch_size = lstm_state[0].shape[1]
+        hidden = hidden.reshape((-1, batch_size, self.lstm.input_size))
+        done = done.reshape((-1, batch_size))
+        new_hidden = []
+        for h, d in zip(hidden, done):
+            h, lstm_state = self.lstm(
+                h.unsqueeze(0),
+                (
+                    (1.0 - d).view(1, -1, 1) * lstm_state[0],
+                    (1.0 - d).view(1, -1, 1) * lstm_state[1],
+                ),
+            )
+            new_hidden += [h]
+        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
+        return new_hidden, lstm_state
 
     def get_value(self, x, lstm_state, done):
         hidden, _ = self.get_states(x, lstm_state, done)
@@ -240,25 +241,23 @@ class TeacherAgent(nn.Module):
 
     def get_action_and_value(self, x, lstm_state, done, action=None):
         hidden, lstm_state = self.get_states(x, lstm_state, done)
-
         if self.use_belief_head:
             belief_logits = self.belief_head(hidden)
             belief_dist = torch.softmax(belief_logits, dim=-1)
             hidden = torch.cat([hidden, belief_dist], dim=-1)
-
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), lstm_state
-    
+
     def get_belief(self, x, lstm_state, done):
         assert self.use_belief_head, "belief head does not exist"
         hidden, _ = self.get_states(x, lstm_state, done)
         belief_logits = self.belief_head(hidden)
         belief_dist = torch.softmax(belief_logits, dim=-1)
         return belief_dist
+
 
 def load_student_configs(student_model_dir):
     """
@@ -368,7 +367,7 @@ def make_env(
 
     return thunk
 
-def take_step(agent, envs, action_enum, obs_type, next_obs, next_done, next_lstm_state, device):
+def take_step(agents, envs, action_enums, obs_types, next_obs, next_done, next_lstm_states, device):
     """
     Makes a specified agent take a step in the environment
     Re-maps agent actions to environment action indices using action_enum
@@ -379,24 +378,52 @@ def take_step(agent, envs, action_enum, obs_type, next_obs, next_done, next_lstm
     TODO return
     should return lstm_states to pass it on to the next agent
     """
-    assert len(envs.envs) == 1, "Running multiple environments is currently not supported. Check TODOs (non-exhaustive) in code."
 
-    # get action from student policy
-    actions, _, _, _, next_lstm_state = agent.get_action_and_value(next_obs, next_lstm_state, next_done)
-    
-    # remap actions
-    env_action_enum = envs.envs[0].unwrapped.actions
-    action_names = [action_enum(action.item()).name for action in actions]
-    remapped_actions = torch.tensor([env_action_enum[action_name].value for action_name in action_names]).to(device)
+    num_envs = len(agents)
+    remapped_actions = torch.zeros(num_envs, dtype=torch.long, device=device)
+    new_lstm_h = []
+    new_lstm_c = []
 
-    # set observation type
-    envs.envs[0].unwrapped.set_obs_type(obs_type=obs_type) # TODO - needs change if running multiple environments
+    for i in range(len(agents)):
+        agent = agents[i]
+        env = envs.envs[i]
+        obs_type = obs_types[i]
+        action_enum = action_enums[i]
 
-    next_obs, reward, terminations, truncations, infos = envs.step(remapped_actions.cpu().numpy())
-    next_done = np.logical_or(terminations, truncations)
-    next_obs, next_done, reward = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device), torch.Tensor(reward).to(device)
+        lstm_state_i = (next_lstm_states[0][:, i:i+1, :], next_lstm_states[1][:, i:i+1, :])
+        
+        # set observation type
+        env.unwrapped.set_obs_type(obs_type=obs_type)
+        
+        # get action from student policy
+        obs_i = next_obs[i].unsqueeze(0)  # (1, obs_dim)
+        done_i = next_done[i].unsqueeze(0)  # (1,)
+        action, _, _, _, next_lstm_i = agent.get_action_and_value(obs_i, lstm_state_i, done_i)
+        
+        # remap actions
+        agent_action_name = action_enum(action.item()).name
+        remapped_action = env.unwrapped.actions[agent_action_name].value
+        remapped_actions[i] = remapped_action
 
-    return next_obs, remapped_actions, reward, next_done, next_lstm_state, infos
+        # store updated LSTM state
+        new_lstm_h.append(next_lstm_i[0])  # shape: (num_layers, 1, hidden_dim)
+        new_lstm_c.append(next_lstm_i[1])
+
+    # stack LSTM states along batch (env) dimension
+    new_lstm_h = torch.cat(new_lstm_h, dim=1)  # (num_layers, num_envs, hidden_dim)
+    new_lstm_c = torch.cat(new_lstm_c, dim=1)  # same
+    next_lstm_states = (new_lstm_h, new_lstm_c)
+
+    # step all envs together
+    next_obs_np, reward_np, terminations, truncations, infos = envs.step(remapped_actions.cpu().numpy())
+    next_done_np = np.logical_or(terminations, truncations)
+
+    # convert to torch
+    next_obs = torch.tensor(next_obs_np, dtype=torch.float32, device=device)
+    reward = torch.tensor(reward_np, dtype=torch.float32, device=device)
+    next_done = torch.tensor(next_done_np, dtype=torch.float32, device=device)
+
+    return next_obs, remapped_actions, reward, next_done, next_lstm_states, infos
 
 def rollout_students_and_get_dist_to_goal(
     teacher_env_states,
@@ -490,15 +517,13 @@ def get_new_student_id(student_id, teacher_action, student_knowledges, student_k
     new_knowledge = student_knowledges[student_id].copy()
     if teacher_action.item() == TeacherActions.do_nothing:
         # the last teacher action corresponds to "do nothing" action
-        return student_id
+        return int(student_id)
     else:
         new_knowledge[teacher_action.item()] = 1
         new_student_id = student_knowledge_to_id[tuple(new_knowledge)]
         return new_student_id
 
 def main(args):
-
-    # torch.backends.cudnn.enabled = False
 
     assert args.n_teacher_actions == len(TeacherActions), "n_teacher_actions must match the number of knowledges for now"
 
@@ -525,21 +550,11 @@ def main(args):
     """
     Setup Environment
     """
-    # env setup
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
-    # envs = gym.vector.SyncVectorEnv(
-    #     [make_env(
-    #         args.env_id, i, args.capture_video, run_name, 
-    #         max_steps, action_type, 
-    #         unexpected_state_penalty, n_frame_stacks,
-    #         update_state, shaped_reward, reward_modes,
-    #     ) for i in range(args.num_envs)],
-    # )
-    # 1 env for now. TODO - is there way to parallelize multiple envs?
     envs = gym.vector.SyncVectorEnv(
         [make_env(
             env_configs["env_id"], 
-            0, 
+            i, 
             env_configs["capture_video"], 
             run_name, 
             env_configs["max_steps"],
@@ -549,7 +564,7 @@ def main(args):
             env_configs["update_state"], 
             env_configs["shaped_reward"], 
             env_configs["reward_modes"],
-        )],
+        ) for i in range(args.num_envs)],
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
     
@@ -661,40 +676,48 @@ def main(args):
     """
     Storage Setup
     """
-    teacher_obs_buffer = torch.zeros((args.num_steps, teacher_agent.input_dim)).to(device)
-    teacher_action_buffer = torch.zeros((args.num_steps), dtype=torch.long).to(device)
-    student_traj_buffer = torch.zeros((args.num_steps, vqvae_model.in_dim)).to(device)
+    teacher_obs_buffer = torch.zeros((args.num_envs, args.num_steps, teacher_agent.input_dim), device=device)
+    teacher_action_buffer = torch.zeros((args.num_envs, args.num_steps), dtype=torch.long, device=device)
+    student_traj_buffer = torch.zeros((args.num_envs, args.num_steps, vqvae_model.in_dim), device=device)
     # logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    logprobs = torch.zeros((args.num_steps)).to(device)
+    logprobs = torch.zeros((args.num_envs, args.num_steps), device=device)
     # student_rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    student_rewards = torch.zeros((args.num_steps)).to(device)
-    teacher_rewards = torch.zeros(args.num_steps).to(device)
-    dones = torch.zeros((args.num_steps)).to(device)
-    values = torch.zeros((args.num_steps)).to(device)
+    student_rewards = torch.zeros((args.num_envs, args.num_steps), device=device)
+    teacher_rewards = torch.zeros((args.num_envs, args.num_steps), device=device)
+    dones = torch.zeros((args.num_envs, args.num_steps), device=device)
+    values = torch.zeros((args.num_envs, args.num_steps), device=device)
 
     # Choose a random student
-    student_id = np.random.choice(n_students)
-    student_agent = student_models[student_id]
+    student_ids = np.random.choice(n_students, size=args.num_envs)
+    student_agents = [student_models[sid] for sid in student_ids]
+    student_obs_type_list = [student_obs_types[sid] for sid in student_ids]
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
     envs.reset(seed=args.seed)
-    envs.envs[0].unwrapped.set_obs_type(student_obs_types[student_id]) # set observation return type
-    next_student_obs = envs.envs[0].unwrapped.gen_obs() # this is the observation student sees (may be different from what teacher sees)
-    next_student_obs = torch.tensor(next_student_obs, dtype=torch.float32).to(device)
-    next_teacher_obs = envs.envs[0].unwrapped.gen_gt_obs()
-    next_teacher_obs = torch.tensor(next_teacher_obs, dtype=torch.float32).to(device)
-    # next_obs, _ = envs.reset(seed=args.seed) # This is the student's observation
-    # next_obs = torch.Tensor(next_obs).to(device)
+
+    for i in range(args.num_envs):
+        envs.envs[i].unwrapped.set_obs_type(student_obs_type_list[i])
+
+    next_student_obs = torch.stack([
+        torch.tensor(envs.envs[i].unwrapped.gen_obs(), dtype=torch.float32)
+        for i in range(args.num_envs)
+    ], dim=0).to(device)
+
+    next_teacher_obs = torch.stack([
+        torch.tensor(envs.envs[i].unwrapped.gen_gt_obs(), dtype=torch.float32)
+        for i in range(args.num_envs)
+    ], dim=0).to(device)
+
     next_done = torch.zeros(args.num_envs).to(device)
     next_student_lstm_state = (
-        torch.zeros(student_agent.lstm.num_layers, args.num_envs, student_agent.lstm.hidden_size).to(device),
-        torch.zeros(student_agent.lstm.num_layers, args.num_envs, student_agent.lstm.hidden_size).to(device),
+        torch.zeros(student_agents[0].lstm.num_layers, args.num_envs, student_agents[0].lstm.hidden_size, device=device),
+        torch.zeros(student_agents[0].lstm.num_layers, args.num_envs, student_agents[0].lstm.hidden_size, device=device),
     )
     next_teacher_lstm_state = (
-        torch.zeros(teacher_agent.lstm.num_layers, args.num_envs, teacher_agent.lstm.hidden_size).to(device),
-        torch.zeros(teacher_agent.lstm.num_layers, args.num_envs, teacher_agent.lstm.hidden_size).to(device),
+        torch.zeros(teacher_agent.lstm.num_layers, args.num_envs, teacher_agent.lstm.hidden_size, device=device),
+        torch.zeros(teacher_agent.lstm.num_layers, args.num_envs, teacher_agent.lstm.hidden_size, device=device),
     )  # hidden and cell states (see https://youtu.be/8HyCNIVRbSU)
 
     """
@@ -703,15 +726,11 @@ def main(args):
     for iteration in tqdm(range(1, args.num_iterations + 1)):
 
         # clear out student trajectory buffer to avoid values from previous iterations affecting zq computation
-        student_traj_buffer = torch.zeros((args.num_steps, vqvae_model.in_dim)).to(device)
+        student_traj_buffer = torch.zeros((args.num_envs, args.num_steps, vqvae_model.in_dim), device=device)
 
-        # initial_teacher_lstm_state = (next_teacher_lstm_state[0].clone(), next_teacher_lstm_state[1].clone())
-        initial_teacher_lstm_state = (
-            next_teacher_lstm_state[0].clone().detach(), 
-            next_teacher_lstm_state[1].clone().detach(),
-        )
+        initial_teacher_lstm_state = (next_teacher_lstm_state[0].clone(), next_teacher_lstm_state[1].clone())
 
-        teacher_action = TeacherActions.do_nothing 
+        teacher_action = torch.full((args.num_envs,), TeacherActions.do_nothing, device=device, dtype=torch.long)
 
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -720,8 +739,8 @@ def main(args):
             optimizer.param_groups[0]["lr"] = lrnow
 
         # keep track of teacher performance per episode
-        episode_teacher_reward = 0
-        episode_n_redundant_disclosures = 0
+        episode_teacher_reward = torch.zeros(args.num_envs, device=device)
+        episode_n_redundant_disclosures = torch.zeros(args.num_envs, device=device)
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -729,126 +748,198 @@ def main(args):
             Step the current student
             """
             next_student_obs, student_actions, student_reward, next_done, next_student_lstm_state, student_infos = take_step(
-                agent=student_agent,
+                agents=student_agents,
                 envs=envs,
-                action_enum=student_action_enums[student_id],
-                obs_type=student_obs_types[student_id],
+                action_enums=[student_action_enums[sid] for sid in student_ids],
+                obs_types=student_obs_type_list,
                 next_obs=next_student_obs,
                 next_done=next_done,
-                next_lstm_state=next_student_lstm_state,
+                next_lstm_states=next_student_lstm_state,
                 device=device,
             )
-            dones[step] = next_done.item()
-            student_rewards[step] = student_reward.item()
+            dones[:,step] = next_done
+            student_rewards[:,step] = student_reward
 
             """
             Get teacher observation (zq, s_t, a_T)
             """
             # encode student trajectory into zq
             # concatenate teacher state, student action, and student reward into a single step of student trajectory, add to buffer
-            traj_step = torch.cat([ # 1 step of student trajectory
+            traj_step = torch.cat([
                 next_teacher_obs, 
-                student_actions.float(), 
-                student_reward,
-            ])
-            student_traj_buffer[step] = traj_step
-            # 
-            num_valid_steps = min(step + 1, n_vqvae_input_steps) # number of real (unpadded) steps to encode
-            start_idx = max(0, step - n_vqvae_input_steps)
-            mask = torch.zeros(n_vqvae_input_steps, dtype=torch.float32).to(device)
-            mask[:num_valid_steps] = 1
-            _, z_q, _, _ = vqvae_model.get_embeddings(
-                x={
-                    "traj": student_traj_buffer[start_idx:start_idx+n_vqvae_input_steps].unsqueeze(0),
-                    "mask": mask.unsqueeze(0),
-                }, 
-            )
+                student_actions.float().unsqueeze(1), 
+                student_reward.unsqueeze(1)
+            ], dim=1)
+ 
+            student_traj_buffer[:,step] = traj_step
 
-            # concat zq, st, teacher_action -> put in teacher obs buffer
-            z_q = z_q.detach()
-            zq_last_step = z_q[0,num_valid_steps-1,:].to(device) # NOTE - needs fixed if training multiple environments
-            teacher_obs = torch.cat([zq_last_step, next_teacher_obs, torch.tensor([teacher_action]).to(device)]).detach()
-            teacher_obs_buffer[step] = teacher_obs
+            for env_idx in range(args.num_envs):
+                num_valid_steps = min(step + 1, n_vqvae_input_steps)
+                start_idx = max(0, step - n_vqvae_input_steps + 1)
+                traj_chunk = student_traj_buffer[env_idx, start_idx:step + 1]  # (≤T, D)
+                pad_len = n_vqvae_input_steps - traj_chunk.shape[0]
+                padded_traj = F.pad(traj_chunk, (0, 0, 0, pad_len))  # (T, D)
+
+                mask = torch.zeros(n_vqvae_input_steps, dtype=torch.float32, device=device)
+                mask[:traj_chunk.shape[0]] = 1
+
+                _, z_q, _, _ = vqvae_model.get_embeddings(
+                    x={
+                        "traj": padded_traj.unsqueeze(0),  # (1, T, D)
+                        "mask": mask.unsqueeze(0),         # (1, T)
+                    }
+                )
+                z_q = z_q.detach()
+                zq_last_step = z_q[0, traj_chunk.shape[0]-1]  # (zq_dim,)
+                teacher_obs = torch.cat([
+                    zq_last_step,
+                    next_teacher_obs[env_idx],
+                    torch.tensor([TeacherActions.do_nothing], device=device)
+                ])
+                # teacher_obs_buffer[step, env_idx] = teacher_obs
+                teacher_obs_buffer[env_idx, step] = teacher_obs
 
             """
             Take teacher action
             """
-            # ALGO LOGIC: action logic
-            with torch.no_grad():
-                teacher_action, logprob, _, value, next_teacher_lstm_state = teacher_agent.get_action_and_value(
-                    teacher_obs_buffer[step].unsqueeze(0), 
-                    next_teacher_lstm_state, 
-                    next_done,
+            # Initialize containers for step-wise outputs
+            logprobs_step = []
+            values_step = []
+            teacher_action_step = []
+            new_teacher_lstm_h = []
+            new_teacher_lstm_c = []
+
+            for env_idx in range(args.num_envs):
+                # Slice input for the current environment
+                obs_i = teacher_obs_buffer[env_idx, step].unsqueeze(0)      
+                done_i = next_done[env_idx].unsqueeze(0)                     
+                lstm_state_i = (
+                    next_teacher_lstm_state[0][:, env_idx:env_idx+1, :],     
+                    next_teacher_lstm_state[1][:, env_idx:env_idx+1, :]
                 )
-                values[step] = value.flatten()
-            teacher_action_buffer[step] = teacher_action
-            logprobs[step] = logprob.item()
+
+                with torch.no_grad():
+                    action_i, logprob_i, _, value_i, lstm_state_i_next = teacher_agent.get_action_and_value(
+                        obs_i, lstm_state_i, done_i
+                    )
+                # Store outputs
+                teacher_action_step.append(action_i.squeeze(0))  # scalar
+                logprobs_step.append(logprob_i.squeeze(0))
+                values_step.append(value_i.flatten().squeeze(0))
+                new_teacher_lstm_h.append(lstm_state_i_next[0])  # (num_layers, 1, hidden_dim)
+                new_teacher_lstm_c.append(lstm_state_i_next[1])
+
+            # Stack outputs back to (num_envs, ...) shape
+            teacher_action = torch.stack(teacher_action_step)
+            teacher_action_buffer[:, step] = teacher_action
+            logprobs[:, step] = torch.stack(logprobs_step)
+            values[:, step] = torch.stack(values_step)
+
+            # Reconstruct LSTM state (num_layers, num_envs, hidden_dim)
+            next_teacher_lstm_state = (
+                torch.cat(new_teacher_lstm_h, dim=1),  # h
+                torch.cat(new_teacher_lstm_c, dim=1),  # c
+            )
+
 
             # find out agent type after the teacher takes action
-            new_student_id = get_new_student_id(student_id, teacher_action, student_knowledges, student_knowledge_to_id)
+            new_student_ids = []
+            for sid, a_T in zip(student_ids, teacher_action):
+                new_student_ids.append(get_new_student_id(sid, a_T, student_knowledges, student_knowledge_to_id))
 
             """
             Compute VoI reward
             """
-            # roll out the student before and after teacher action and get the distance to goal afterwards
-            dist_to_goal, n_steps_completed = rollout_students_and_get_dist_to_goal(
-                teacher_env_states=envs.envs[0].unwrapped.get_internal_state(),
-                rollout_envs=rollout_envs,
-                student_agents=student_models,
-                student_action_enums=student_action_enums,
-                student_obs_types=student_obs_types,
-                initial_student_lstm_state=next_student_lstm_state,
-                n_rollout_steps=args.n_rollout_steps_for_voi_computation,
-                device=device,
-            )
-            utilities = {id : -dist_to_goal[id] + args.n_rollout_steps_for_voi_computation - n_steps_completed[id] for id in dist_to_goal.keys()}
-            
-            # get belief over student types
-            with torch.no_grad():
-                student_type_belief = teacher_agent.get_belief(
-                    x=teacher_obs_buffer[step].unsqueeze(0),
-                    lstm_state=next_teacher_lstm_state,
-                    done=next_done,
-                )[0].detach().cpu().numpy()
-            
-            reward_voi = compute_voi_reward(
-                student_knowledges=student_knowledges,
-                student_knowledge_to_id=student_knowledge_to_id,
-                utilities=utilities,
-                teacher_action=teacher_action,
-                student_type_belief=student_type_belief,
-            )
-            teacher_rewards[step] = reward_voi.item()
-            episode_teacher_reward += reward_voi.item()
-            redundant = (
-                teacher_action != TeacherActions.do_nothing and
-                student_knowledges[student_id][teacher_action.item()] == 1
-            )
-            episode_n_redundant_disclosures += int(redundant)
+            # for each environment, rollout all students for VoI computation
+            for env_idx in range(args.num_envs):
+                teacher_env_state = envs.envs[env_idx].unwrapped.get_internal_state()
+
+                dist_to_goal, n_steps_completed = rollout_students_and_get_dist_to_goal(
+                    teacher_env_states=teacher_env_state,
+                    rollout_envs=rollout_envs,
+                    student_agents=list(student_models.values()),
+                    student_action_enums=list(student_action_enums.values()),
+                    student_obs_types=list(student_obs_types.values()),
+                    initial_student_lstm_state=(
+                        next_student_lstm_state[0][:, env_idx:env_idx+1, :].contiguous(),
+                        next_student_lstm_state[1][:, env_idx:env_idx+1, :].contiguous(),
+                    ),
+                    n_rollout_steps=args.n_rollout_steps_for_voi_computation,
+                    device=device,
+                )
+
+                utilities = {
+                    id: -dist_to_goal[id] + args.n_rollout_steps_for_voi_computation - n_steps_completed[id]
+                    for id in dist_to_goal
+                }
+
+                # Compute reward for this env
+                with torch.no_grad():
+                    belief = teacher_agent.get_belief(
+                        x=teacher_obs_buffer[env_idx, step].unsqueeze(0),
+                        lstm_state=(
+                            next_teacher_lstm_state[0][:, env_idx:env_idx+1, :],
+                            next_teacher_lstm_state[1][:, env_idx:env_idx+1, :]
+                        ),
+                        done=next_done[env_idx:env_idx+1],
+                    )[0].detach().cpu().numpy()
+
+                voi_reward = compute_voi_reward(
+                    student_knowledges=student_knowledges,
+                    student_knowledge_to_id=student_knowledge_to_id,
+                    utilities=utilities,
+                    teacher_action=teacher_action[env_idx],
+                    student_type_belief=belief,
+                )
+                teacher_rewards[env_idx, step] = voi_reward
+                episode_teacher_reward[env_idx] += voi_reward
+
+                redundant = (
+                    teacher_action[env_idx] != TeacherActions.do_nothing and
+                    student_knowledges[student_ids[env_idx]][teacher_action[env_idx].item()] == 1
+                )
+                episode_n_redundant_disclosures[env_idx] += int(redundant)
 
             """
             Log teacher and student performances at the end of episode
             """
             if "final_info" in student_infos:
-                final_student_info = student_infos["final_info"][0]
-                episode_len = final_student_info["episode"]["l"]
-                # student performance
-                writer.add_scalar("charts/student_episodic_reward", final_student_info["episode"]["r"])
-                writer.add_scalar("charts/student_episodic_length", final_student_info["episode"]["l"])
-                # teacher performance
-                writer.add_scalar("charts/episodic_voi_reward", episode_teacher_reward, global_step)
-                writer.add_scalar("charts/episodic_redundant_rate", episode_n_redundant_disclosures / episode_len)
-                writer.add_scalar("charts/episodic_redundant_count", episode_n_redundant_disclosures)
+                final_infos = student_infos["final_info"]
+                finished_env_indices = [i for i, info in enumerate(final_infos) if info is not None]
+                if len(finished_env_indices) > 0:
+                    episode_lengths = np.array([final_infos[i]["episode"]["l"] for i in finished_env_indices])
+                    # episode_lengths = torch.tensor([final_infos[i]["episode"]["l"] for i in finished_env_indices], device=device)
+                    episode_lengths = torch.tensor(episode_lengths, device=device)
+                    for i in finished_env_indices:
+                        writer.add_scalar("charts/student_episodic_reward", final_infos[i]["episode"]["r"], global_step + i)
+                        writer.add_scalar("charts/student_episodic_length", final_infos[i]["episode"]["l"], global_step + i)
 
-                episode_teacher_reward = 0
-                episode_n_redundant_disclosures = 0
+                    writer.add_scalar(
+                        "charts/episodic_voi_reward",
+                        episode_teacher_reward[finished_env_indices].mean().item(),
+                        global_step
+                    )
+                    writer.add_scalar(
+                        "charts/episodic_redundant_rate",
+                        (episode_n_redundant_disclosures[finished_env_indices] / episode_lengths).mean().item(),
+                        global_step
+                    )
+                    writer.add_scalar(
+                        "charts/episodic_redundant_count",
+                        episode_n_redundant_disclosures[finished_env_indices].mean().item(),
+                        global_step
+                    )
 
-            student_id = new_student_id
+                    # Reset only for finished environments
+                    episode_teacher_reward[finished_env_indices] = 0
+                    episode_n_redundant_disclosures[finished_env_indices] = 0
 
+            student_ids = new_student_ids
+        
         # bootstrap value if not done
         with torch.no_grad():
             next_value = teacher_agent.get_value(
-                teacher_obs.unsqueeze(0),
+                teacher_obs_buffer[:,-1],
                 next_teacher_lstm_state,
                 next_done,
             ).reshape(1, -1)
@@ -859,10 +950,10 @@ def main(args):
                     nextnonterminal = 1.0 - next_done
                     nextvalues = next_value
                 else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = teacher_rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                    nextnonterminal = 1.0 - dones[:,t + 1]
+                    nextvalues = values[:,t + 1]
+                delta = teacher_rewards[:,t] + args.gamma * nextvalues * nextnonterminal - values[:,t]
+                advantages[:,t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
         # flatten the batch
