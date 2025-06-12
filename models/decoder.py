@@ -198,14 +198,12 @@ class TransformerActionPredictor(nn.Module):
         self.latent_proj = nn.Linear(embedding_dim, d_model)
         self.out = nn.Linear(d_model, num_actions)
 
-    def forward(self, z_q, state, target_actions=None):
+    def forward(self, z_q, z_q_mask, state, target_actions=None):
         """
         z_q: [B, T_latent, D]
         state: [B, state_dim]
         target_actions: [B, n_steps] (optional, used for teacher forcing)
         """
-        n_total_steps = target_actions.size(1) if target_actions is not None else self.n_future_steps + self.n_past_steps
-
         B = z_q.shape[0]
 
         # encode memory from discrete latents
@@ -230,9 +228,10 @@ class TransformerActionPredictor(nn.Module):
 
         # tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.n_steps).to(tokens.device)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(tokens.size(0)).to(tokens.device)
+        memory_key_padding_mask = (z_q_mask == 0) # True where padded
 
         # out = self.transformer(tgt=tokens, memory=memory, tgt_mask=tgt_mask)
-        out = self.transformer(tgt=tokens, memory=memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
+        out = self.transformer(tgt=tokens, memory=memory, memory_key_padding_mask=memory_key_padding_mask, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
 
         logits = self.out(out.transpose(0, 1))  # [B, n_steps, num_actions]
         # logits = self.out(out.transpose(0, 1))[:, 1:]  # discard state part of sequence?

@@ -142,6 +142,10 @@ class VectorQuantizer(nn.Module):
         # Quantized latent vector
         z_q_flat = torch.matmul(min_encodings, self.embedding.weight)  # (B*T, D)
 
+        # Mask out padded timesteps
+        if flat_mask is not None:
+            z_q_flat = z_q_flat * flat_mask + z_flattened * (1 - flat_mask) # replace padded timesteps with original values
+
         # Reshape to original shape
         z_q = z_q_flat.view_as(z)
 

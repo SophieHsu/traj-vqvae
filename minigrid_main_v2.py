@@ -132,10 +132,10 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                 gt_mask = torch.cat((mask, future_mask[:,:model.n_future_steps]), dim=1)
                 gt_actions[gt_mask == 0] = -100
                 # breakpoint()
-                n_pred_past_train += gt_mask[:model.n_past_steps].sum().item()
-                n_correct_past_train += (predicted_actions[:model.n_past_steps] == gt_actions[:model.n_past_steps]).sum().item()
-                n_pred_future_train += gt_mask[model.n_past_steps:].sum().item()
-                n_correct_future_train += (predicted_actions[model.n_past_steps:] == gt_actions[model.n_past_steps:]).sum().item()
+                n_pred_past_train += gt_mask[:, :model.n_past_steps].sum().item()
+                n_correct_past_train += (predicted_actions[:,:model.n_past_steps] == gt_actions[:, :model.n_past_steps]).sum().item()
+                n_pred_future_train += gt_mask[:, model.n_past_steps:].sum().item()
+                n_correct_future_train += (predicted_actions[:, model.n_past_steps:] == gt_actions[:, model.n_past_steps:]).sum().item()
             n_correct_train += (predicted_actions == gt_actions).sum().item()
             n_pred_train += gt_mask.sum().item()
             train_n_pred.append(n_pred_train)
@@ -226,10 +226,10 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                     gt_actions = torch.cat((action_indices, future_action_indices[:,:model.n_future_steps]), dim=1)
                     gt_mask = torch.cat((mask, future_mask[:,:model.n_future_steps]), dim=1)
                     gt_actions[gt_mask == 0] = -100
-                    n_pred_past_val += gt_mask[:model.n_past_steps].sum().item()
-                    n_correct_past_val += (predicted_actions[:model.n_past_steps] == gt_actions[:model.n_past_steps]).sum().item()
-                    n_pred_future_val += gt_mask[model.n_past_steps:].sum().item()
-                    n_correct_future_val += (predicted_actions[model.n_past_steps:] == gt_actions[model.n_past_steps:]).sum().item()
+                    n_pred_past_val += gt_mask[:,:model.n_past_steps].sum().item()
+                    n_correct_past_val += (predicted_actions[:,:model.n_past_steps] == gt_actions[:,:model.n_past_steps]).sum().item()
+                    n_pred_future_val += gt_mask[:,model.n_past_steps:].sum().item()
+                    n_correct_future_val += (predicted_actions[:,model.n_past_steps:] == gt_actions[:,model.n_past_steps:]).sum().item()
                 n_correct_val += (predicted_actions == gt_actions).sum().item()
                 n_pred_val += gt_mask.sum().item()
                 val_n_pred.append(n_pred_val)
@@ -241,7 +241,7 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
             codebook_size=args.n_embeddings,
         )
         if args.track:
-            wandb.run.log({f"{key}entropy_valid": codebook_use_entropy[key] for key in codebook_use_entropy.keys()})
+            wandb.run.log({f"{key}_entropy_valid": codebook_use_entropy[key] for key in codebook_use_entropy.keys()})
 
         # print("sampled agents during training", sampled_agents_train)
         # print("sampled agents during validation", sampled_agents_valid)
@@ -271,7 +271,7 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
                 "train_accuracy_future": n_correct_future_train / n_pred_future_train,
                 "valid_accuracy": n_correct_val / n_pred_val,
                 "valid_accuracy_past": n_correct_past_val / n_pred_past_val,
-                "valid_accyracy_future": n_correct_future_val / n_pred_future_val,
+                "valid_accuracy_future": n_correct_future_val / n_pred_future_val,
             })
     
             # save model checkpoint
@@ -306,33 +306,34 @@ def eval_vqvae(model, train_loader, val_loader, save_dir, device):
         masks = []
 
         for batch in loader:
-            # Move data to device
-            state0 = batch['state0'].to(device)
-            state1 = batch['state1'].to(device)
-            action_indices = batch['action_indices'].to(device)
-            reward = batch['reward'].to(device)
-            mask = batch["mask"].to(device)
-            future_state = batch["future_state"].to(device)
-            future_action_indices = batch["future_action_indices"].to(device)
-            future_mask = batch["future_mask"].to(device)
-            agent_id = batch["agent_id"]
-            agent_ids.append(agent_id)
+            with torch.no_grad():
+                # Move data to device
+                state0 = batch['state0'].to(device)
+                state1 = batch['state1'].to(device)
+                action_indices = batch['action_indices'].to(device)
+                reward = batch['reward'].to(device)
+                mask = batch["mask"].to(device)
+                future_state = batch["future_state"].to(device)
+                future_action_indices = batch["future_action_indices"].to(device)
+                future_mask = batch["future_mask"].to(device)
+                agent_id = batch["agent_id"]
+                agent_ids.append(agent_id)
 
-            # Concatenate inputs
-            x = torch.cat([state0, action_indices.unsqueeze(-1).float(), reward.unsqueeze(-1)], dim=-1)
-            
-            # Get embeddings
-            z_e, z_q, min_encodings, min_encoding_indices = model.get_embeddings({
-                "traj": x,
-                "mask": mask,
-            })        
+                # Concatenate inputs
+                x = torch.cat([state0, action_indices.unsqueeze(-1).float(), reward.unsqueeze(-1)], dim=-1)
+                
+                # Get embeddings
+                z_e, z_q, min_encodings, min_encoding_indices = model.get_embeddings({
+                    "traj": x,
+                    "mask": mask,
+                })        
 
-            # record codebook usage and z_q's
-            masked_codebook_use = min_encoding_indices.cpu().view(x.shape[0], x.shape[1]) # recover temporal dimension
-            masked_codebook_use[mask == 0] = -100 # replace padded timesteps with placeholder id
-            codebook_usage.append(masked_codebook_use) #  (B, T)
-            z_qs.append(z_q.detach().cpu())
-            masks.append(mask.cpu())
+                # record codebook usage and z_q's
+                masked_codebook_use = min_encoding_indices.cpu().view(x.shape[0], x.shape[1]) # recover temporal dimension
+                masked_codebook_use[mask == 0] = -100 # replace padded timesteps with placeholder id
+                codebook_usage.append(masked_codebook_use) #  (B, T)
+                z_qs.append(z_q.detach().cpu())
+                masks.append(mask.cpu())
 
         agent_ids = torch.cat(agent_ids)
         codebook_usage = torch.cat(codebook_usage, dim=0)
@@ -351,7 +352,7 @@ def eval_vqvae(model, train_loader, val_loader, save_dir, device):
         plot_codebook_usage_heatmap(
             per_agent_data=per_agent_data,
             n_embeddings=args.n_embeddings,
-            savefile=os.path.join(save_dir, f"codebok_usage_{split}.png"),
+            savefile=os.path.join(save_dir, f"codebook_usage_{split}.png"),
         )
 
         plot_tsne(per_agent_data=per_agent_data, savename=os.path.join(save_dir, f"zq_tsne_{split}"))
@@ -460,7 +461,6 @@ def plot_tsne(per_agent_data, savename):
 
     plt.clf()
 
-
 def compute_codebook_use_entropy(codebook_ids, agent_labels, codebook_size, ignore_code=-100):
     entropies = {}
     unique_agents = set(agent_labels.tolist())
@@ -469,7 +469,7 @@ def compute_codebook_use_entropy(codebook_ids, agent_labels, codebook_size, igno
         codebook_usage = codebook_ids[agent_labels == id].flatten() # get all codebook indices used for this agent
         codebook_usage = codebook_usage[codebook_usage != ignore_code] # remove the codes to ignore (padded steps)
         counts = torch.bincount(torch.tensor(codebook_usage), minlength=codebook_size).float()
-        prob = counts / counts.sum()
+        prob = counts / (counts.sum() + 1e-6)
         non_zero_prob = prob[prob > 0] # filter out 0 probability codes to avoid zero division
         entropy = -(non_zero_prob * torch.log2(non_zero_prob)).sum().item()
         entropies[id] = entropy / max_entropy
@@ -511,7 +511,7 @@ def main(args):
     
     # Load data
     print("Loading data...")
-    training_data, validation_data, train_loader, val_loader, x_train_var = load_data_and_data_loaders(
+    _, _, train_loader, val_loader, _ = load_data_and_data_loaders(
         dataset='MINIGRID', batch_size=args.batch_size, 
         sequence_len=args.input_seq_len, balanced_sampling=args.balanced_sampling,
         data_file=args.data_file,
@@ -562,7 +562,7 @@ class Args:
     """Logging"""
     track: bool = False
     wandb_project_name: str = "human-knowledge-vqvae"
-    wandb_entity: str = "ahiranak-university-of-southern-california"
+    wandb_entity: str = "yachuanh"
     plot_dir: str = "test"
     save_interval: int = 50 # number of epochs between each checkpoint saving
 

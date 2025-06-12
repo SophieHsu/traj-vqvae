@@ -309,7 +309,7 @@ class RNNVQVAE(nn.Module):
         # predict past and future
         # target_actions = future_actions[:,:self.decoder.n_steps]
         target_actions = torch.cat((actions, future_actions[:,:self.decoder.n_future_steps]), dim=1)
-        logits = self.decoder(z_q, next_state, target_actions)
+        logits = self.decoder(z_q, mask, next_state, target_actions)
 
         # compute CE loss, masking out effects from timesteps where ground truth prediction target does not exist
         target_mask = torch.cat([mask, future_mask[:,:self.decoder.n_future_steps]], dim=1)
