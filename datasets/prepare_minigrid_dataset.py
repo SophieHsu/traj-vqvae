@@ -46,18 +46,19 @@ def combine_datasets(data_dir, save_path):
             # copy data to new dataset, along with agent IDs
             for traj_idx in data.keys():
                 traj_data = data[traj_idx]
-                new_traj_group = combined_data.create_group(f"traj_{n_traj}")
+                if "episode_len" in traj_data.attrs:
+                    new_traj_group = combined_data.create_group(f"traj_{n_traj}")
 
-                # Copy all datasets
-                for dataset_name in traj_data.keys():
-                    traj_data.copy(dataset_name, new_traj_group)
+                    # Copy all datasets
+                    for dataset_name in traj_data.keys():
+                        traj_data.copy(dataset_name, new_traj_group)
 
-                # Copy attributes
-                for attr_name, attr_value in traj_data.attrs.items():
-                    new_traj_group.attrs[attr_name] = attr_value
-                new_traj_group.attrs["agent_id"] = agent_id  # Add agent ID
+                    # Copy attributes
+                    for attr_name, attr_value in traj_data.attrs.items():
+                        new_traj_group.attrs[attr_name] = attr_value
+                    new_traj_group.attrs["agent_id"] = agent_id  # Add agent ID
 
-                n_traj += 1
+                    n_traj += 1
 
 def main(args):
     combine_datasets(data_dir=args.data_root_dir, save_path=args.save_path)
