@@ -31,6 +31,10 @@ def misclassification_validity_check(
     action_trajs,           # (B, T)
     n_invisible_collisions, # (B,)
 ):
+    """
+    validity = 1 if correct, 0 if justified incorrect, -1 if unjustified incorrect
+    """
+    action_trajs = action_trajs.to(torch.long)
     B, T = action_trajs.shape
     A = AGENT_ACTION_MASKS.shape[1]
 
@@ -38,7 +42,6 @@ def misclassification_validity_check(
     valid_mask = (action_trajs >= 0)  # shape: (B, T), bool
     action_trajs_clipped = action_trajs.clone()
     action_trajs_clipped[~valid_mask] = 0  # replace with 0 temporarily
-
     action_trajs_onehot = torch.nn.functional.one_hot(action_trajs_clipped, num_classes=A)  # (B, T, A)
 
     # mask out padded steps

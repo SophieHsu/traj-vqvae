@@ -4,6 +4,7 @@ import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
+import tqdm
 
 """
 Teacher Training Datasets
@@ -117,7 +118,7 @@ class MultiAgentTrajectoryDataset(Dataset):
             self, 
             data_file_path: str,
             sequence_len: int = 30,
-            stride: int = 1,    
+            stride: int = 5,    
         ):
         self.trajectories = [] 
         self.action_to_idx = {}  # Dictionary to store action name to index mapping

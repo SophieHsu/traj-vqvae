@@ -290,7 +290,7 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
     
     return
 
-def eval_vqvae(model, train_loader, val_loader, save_dir, device):
+def eval_vqvae(model, train_loader, val_loader, save_dir, device, args):
 
     model.eval()
 
@@ -516,6 +516,7 @@ def main(args):
         sequence_len=args.input_seq_len, balanced_sampling=args.balanced_sampling,
         data_file=args.data_file,
     )
+    print("Done loading data")
 
     # Initialize model
     model = RNNVQVAE(
@@ -549,7 +550,7 @@ def main(args):
     # Train model
     print("Starting training...")
     train_vqvae(model, train_loader, val_loader, args.num_epochs, args.learning_rate, device)
-    eval_vqvae(model, train_loader, val_loader, save_dir, device)
+    eval_vqvae(model, train_loader, val_loader, save_dir, args, device)
   
 @dataclass
 class Args:
@@ -562,7 +563,7 @@ class Args:
     """Logging"""
     track: bool = False
     wandb_project_name: str = "human-knowledge-vqvae"
-    wandb_entity: str = "yachuanh"
+    wandb_entity: str = "ahiranak-university-of-southern-california"
     plot_dir: str = "test"
     save_interval: int = 50 # number of epochs between each checkpoint saving
 

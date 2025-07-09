@@ -38,12 +38,12 @@ class GumbelCodebookFreeVAE(nn.Module):
         # encode into continuous latent space
         self.encoder = RNNEncoder(in_dim=in_dim, h_dim=h_dim, num_layers=1, bidirectional=True)
         # pass continuous latent vector through discretization bottleneck
-        embedding_dim = h_dim * 2 if bidirectional else h_dim
+        self.embedding_dim = h_dim * 2 if bidirectional else h_dim
         
         # quantizer to discretize embedding
         self.quantizer = GumbelQuantizer(
             num_latents=n_embeddings,
-            e_dim=embedding_dim,
+            e_dim=self.embedding_dim,
             temperature=gumbel_temperature,
         )
 
@@ -256,18 +256,19 @@ class RNNVQVAE(nn.Module):
         self.prediction_type = PredictionTypes.PAST_FUTURE
         self.n_past_steps = n_past_steps
         self.n_future_steps = n_future_steps
+        self.in_dim = in_dim
         
         self.n_actions = n_actions
         # encode image into continuous latent space
-        self.encoder = RNNEncoder(in_dim=in_dim, h_dim=h_dim, num_layers=1, bidirectional=True)
+        self.encoder = RNNEncoder(in_dim=self.in_dim, h_dim=h_dim, num_layers=1, bidirectional=True)
         # pass continuous latent vector through discretization bottleneck
-        embedding_dim = h_dim * 2 if bidirectional else h_dim
+        self.embedding_dim = h_dim * 2 if bidirectional else h_dim
         self.vector_quantization = VectorQuantizer(
-            n_embeddings, embedding_dim, beta, encoder_type="timernn")
+            n_embeddings, self.embedding_dim, beta, encoder_type="timernn")
 
         # decode the discrete latent representation
         self.decoder = TransformerActionPredictor(
-            embedding_dim=embedding_dim, # dimension of z_q
+            embedding_dim=self.embedding_dim, # dimension of z_q
             state_dim=state_dim, # input state dimension (s, a, r)
             num_actions=n_actions,
             n_future_steps=n_future_steps,
