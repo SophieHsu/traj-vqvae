@@ -63,8 +63,8 @@ class Args:
     save_interval: int = 100 # number of epochs between each checkpoint saving
 
     """VQVAE Model Settings"""
-    vqvae_model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/9R2.5k-dstar"
-    vqvae_checkpoint_file: str = "checkpoint_epoch_13500.pt"
+    vqvae_model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/9R2.5k-astar"
+    vqvae_checkpoint_file: str = "checkpoint_epoch_200.pt"
 
     """Training Hyperparams"""
     num_epochs: int = 5000
@@ -75,6 +75,7 @@ class Args:
     action_embedding_dim: int = 16
     teacher_hidden_dim: int = 128
     n_steps_for_voi: int = 6
+    z_flatten_method: str = "last_step"
 
     """Algorithm specific arguments"""
     total_timesteps: int = int(1e9)
@@ -130,11 +131,6 @@ STUDENT_ACTIONS = {
     # 4: [0, 2],
     # 5: [1, 2],
 }
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
 
 def make_env(
         env_id, idx, capture_video, run_name,
@@ -340,6 +336,9 @@ def main(args):
     student_rewards_buffer = torch.zeros((args.num_envs, args.num_steps), device=device)
     dones_buffer = torch.zeros((args.num_envs, args.num_steps), device=device)
 
+    steps_since_reset = torch.zeros((args.num_envs), device=device)
+
+
     # Choose a random student for each environment
     student_ids = np.random.choice(n_students, size=args.num_envs)
     student_visibles_list = [STUDENT_VISIBLE_THINGS[sid] for sid in student_ids]
@@ -365,6 +364,13 @@ def main(args):
     ], dim=0).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
+    if args.track:
+        # dump args to config file
+        config_save_path = os.path.join(wandb.run.dir, "config.yaml")
+        with open(config_save_path, "w") as f:
+            arg_vars = vars(args)
+            arg_vars["teacher_model_class"] = type(teacher_model).__name__
+            yaml.dump(arg_vars, f)
 
     """
     Main Training Loop
@@ -379,7 +385,8 @@ def main(args):
         student_type_labels_buffer.zero_()
         student_rewards_buffer.zero_()
         dones_buffer.zero_()
-        
+        steps_since_reset.zero_()
+
         # initial teacher action is do_nothing
         prev_teacher_action = torch.full((args.num_envs,), TeacherActions.do_nothing, device=device, dtype=torch.long)
 
@@ -428,6 +435,8 @@ def main(args):
             student_reward = torch.tensor(student_reward, dtype=torch.float32, device=device)
             student_rewards_buffer[:,step] = student_reward.detach()
 
+            steps_since_reset += 1
+
             """
             Get input to VQVAE
             """
@@ -459,7 +468,10 @@ def main(args):
                 }
             )
             z_q = z_q.detach()
-            zq_collapsed = z_q[:, traj_chunk.shape[1]-1] # TODO - currently last step. change to running mean
+            if args.z_flatten_method == "last_step":
+                zq_collapsed = z_q[:, traj_chunk.shape[1]-1] # TODO - currently last step. change to running mean
+            elif args.z_flatten_method == "mean":
+                zq_collapsed = (mask.unsqueeze(-1) * z_q).mean(dim=1)
             zq_buffer[:,step] = zq_collapsed
             
             """
@@ -590,6 +602,7 @@ def main(args):
                     student_visibles_list[i] = STUDENT_VISIBLE_THINGS[student_ids[i]]
                     envs.envs[i].unwrapped.set_obs_type(student_visibles_list[i])
                     env_states[i] = torch.tensor(envs.envs[i].unwrapped.gen_gt_obs(), dtype=torch.float32).to(device)
+                    steps_since_reset[i] = 0
 
             # print(f"alloc={torch.cuda.memory_allocated()/1e6:.1f} MB | "f"reserved={torch.cuda.memory_reserved()/1e6:.1f} MB")
 
@@ -632,6 +645,7 @@ def main(args):
             belief_loss = F.cross_entropy(belief_logits, mb_labels)
             voi_loss = F.mse_loss(pred_voi, mb_voi)
             loss = voi_loss + belief_loss
+            # breakpoint()
 
             # update
             teacher_optimizer.zero_grad()
