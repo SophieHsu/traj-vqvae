@@ -63,8 +63,8 @@ class Args:
     save_interval: int = 100 # number of epochs between each checkpoint saving
 
     """VQVAE Model Settings"""
-    vqvae_model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/9R2.5k-astar"
-    vqvae_checkpoint_file: str = "checkpoint_epoch_200.pt"
+    vqvae_model_dir: str = "/home/ayanoh/traj-vqvae/trained_vqvae_models/9R2.5k-dstar"
+    vqvae_checkpoint_file: str = "checkpoint_epoch_1500.pt"
 
     """Training Hyperparams"""
     num_epochs: int = 5000
@@ -75,7 +75,7 @@ class Args:
     action_embedding_dim: int = 16
     teacher_hidden_dim: int = 128
     n_steps_for_voi: int = 6
-    z_flatten_method: str = "last_step"
+    z_flatten_method: str = "mean"
 
     """Algorithm specific arguments"""
     total_timesteps: int = int(1e9)
@@ -92,6 +92,9 @@ class Args:
     """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
+   
+    z_dim: int = 0
+    state_dim: int = 0
 
 OBS_TYPE_TO_VISIBLE_THINGS = {
     "all": ['grey', 'red', 'blue', 'purple'],
@@ -124,12 +127,6 @@ STUDENT_ACTIONS = {
     3: ["left", "right", "forward"],
     4: ["left", "forward"],
     5: ["right", "forward"],
-    # 0: [0, 1, 2],
-    # 1: [0, 2],
-    # 2: [1, 2],
-    # 3: [0, 1, 2],
-    # 4: [0, 2],
-    # 5: [1, 2],
 }
 
 def make_env(
@@ -262,6 +259,9 @@ def main(args):
     n_vqvae_input_steps = vqvae_model.n_past_steps # number of input steps to the vqvae
     print(vqvae_model)
     print("#"*50, " Done loading representation VQVAE model ", "#"*50)
+    
+    args.z_dim = zq_dim
+    args.state_dim = state_dim
 
     """
     Setup Environment
@@ -318,7 +318,7 @@ def main(args):
         n_teacher_actions=args.n_teacher_actions,
         n_student_types=args.n_student_types,
         action_embedding_dim=args.action_embedding_dim,
-        hidden_dim=args.teacher_hidden_dim,
+        teacher_hidden_dim=args.teacher_hidden_dim,
     ).to(device)
     teacher_optimizer = optim.Adam(teacher_model.parameters(), lr=args.learning_rate, eps=1e-5)
 
@@ -370,7 +370,11 @@ def main(args):
         with open(config_save_path, "w") as f:
             arg_vars = vars(args)
             arg_vars["teacher_model_class"] = type(teacher_model).__name__
-            yaml.dump(arg_vars, f)
+            config_dict = {
+                "teacher": arg_vars,
+                "vqvae": vqvae_model_kwargs,
+            }
+            yaml.dump(config_dict, f)
 
     """
     Main Training Loop
@@ -455,12 +459,30 @@ def main(args):
             """
             Get embedding z_q
             """
-            start_idx = max(0, step - n_vqvae_input_steps + 1)
-            traj_chunk = student_traj_buffer[:, start_idx:step + 1]
-            pad_len = n_vqvae_input_steps - traj_chunk.shape[1]
-            padded_traj = F.pad(traj_chunk, (0, 0, 0, pad_len))
-            mask = torch.zeros((args.num_envs, n_vqvae_input_steps), dtype=torch.float32, device=device)
-            mask[:,:traj_chunk.shape[1]] = 1
+            end_idx = step + 1
+            traj_chunks = []
+            masks = []
+
+            for i in range(args.num_envs):
+                k = min(steps_since_reset[i].item(), n_vqvae_input_steps)
+                start_idx = int(end_idx - k)
+                traj = student_traj_buffer[i, start_idx:end_idx]
+                pad_len = n_vqvae_input_steps - traj.shape[0]
+                padded = F.pad(traj, (0, 0, 0, pad_len))
+                mask = torch.zeros(n_vqvae_input_steps, device=device)
+                mask[:traj.shape[0]] = 1
+                traj_chunks.append(padded.unsqueeze(0)) 
+                masks.append(mask.unsqueeze(0))         
+
+            padded_traj = torch.cat(traj_chunks, dim=0) 
+            mask = torch.cat(masks, dim=0)           
+
+            # start_idx = max(0, step - n_vqvae_input_steps + 1)
+            # traj_chunk = student_traj_buffer[:, start_idx:step + 1]
+            # pad_len = n_vqvae_input_steps - traj_chunk.shape[1]
+            # padded_traj = F.pad(traj_chunk, (0, 0, 0, pad_len))
+            # mask = torch.zeros((args.num_envs, n_vqvae_input_steps), dtype=torch.float32, device=device)
+            # mask[:,:traj_chunk.shape[1]] = 1
             _, z_q, _, _ = vqvae_model.get_embeddings(
                 x={
                     "traj": padded_traj,
@@ -468,8 +490,10 @@ def main(args):
                 }
             )
             z_q = z_q.detach()
-            if args.z_flatten_method == "last_step":
-                zq_collapsed = z_q[:, traj_chunk.shape[1]-1] # TODO - currently last step. change to running mean
+
+            if args.z_flatten_method == "last_step": # TODO - this option not tested
+                last_timestep_idx = mask.sum(dim=1) - 1
+                zq_collapsed = torch.tensor([z_q[:, idx] for idx in last_timestep_idx])
             elif args.z_flatten_method == "mean":
                 zq_collapsed = (mask.unsqueeze(-1) * z_q).mean(dim=1)
             zq_buffer[:,step] = zq_collapsed
@@ -506,7 +530,7 @@ def main(args):
                 for sid in all_student_ids:
                     # generate plan for each student from the current state
                     full_trace, _ = get_astar_plan(
-                        agent_map=env.unwrapped.get_agent_map(visible_things=student_visibles_list[i]), 
+                        agent_map=env.unwrapped.get_agent_map(visible_things=STUDENT_VISIBLE_THINGS[sid]), 
                         true_map=env.unwrapped.get_true_map(),
                         agent_pos=env.unwrapped.agent_pos,
                         agent_dir=env.unwrapped.agent_dir,
@@ -537,7 +561,8 @@ def main(args):
                     student_values[sid][i] = -n_grids_to_goal + args.n_steps_for_voi - n_steps_taken
 
             voi_gts = compute_gt_voi(
-                student_ids=student_ids,
+                # student_ids=student_ids,
+                student_ids=[3,3,3,3], # 
                 student_values=student_values,
                 num_teacher_actions=args.n_teacher_actions,
                 student_knowledge_array=student_knowledge_array,

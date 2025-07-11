@@ -21,6 +21,7 @@ import wandb
 import tyro
 import time
 import random
+import yaml
 from tqdm import tqdm
 
 from dataclasses import dataclass
@@ -40,6 +41,12 @@ def train_vqvae(model, train_loader, val_loader, num_epochs, learning_rate, devi
         )
         if wandb.run is not None:
             wandb.run.log_code(".")
+
+        # dump args to config file
+        config_save_path = os.path.join(wandb.run.dir, "config.yaml")
+        with open(config_save_path, "w") as f:
+            arg_vars = vars(args)
+            yaml.dump(arg_vars, f)
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
@@ -363,7 +370,8 @@ def plot_codebook_usage_heatmap(per_agent_data, n_embeddings, savefile, ignore_i
         where agent_id = 0, 1, 2, ...
     """
     unique_agents = list(per_agent_data.keys())
-    usage_matrix = np.zeros((len(unique_agents), n_embeddings))
+    # usage_matrix = np.zeros((len(unique_agents), n_embeddings))
+    usage_matrix = np.zeros((6, n_embeddings))
 
     for agent in unique_agents:
         codebook_ids = per_agent_data[agent]["codebook_ids"]

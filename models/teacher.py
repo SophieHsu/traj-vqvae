@@ -98,7 +98,7 @@ class VoICriticTeacherModel(nn.Module):
         n_teacher_actions, 
         n_student_types,
         action_embedding_dim=16,
-        hidden_dim=128,
+        teacher_hidden_dim=128,
     ):
         """
         Args:
@@ -114,20 +114,20 @@ class VoICriticTeacherModel(nn.Module):
         self.state_dim = state_dim
         self.n_teacher_actions = n_teacher_actions
         self.n_student_types = n_student_types
-        self.hidden_dim = hidden_dim
+        self.hidden_dim = teacher_hidden_dim
 
         self.belief_head = BeliefHead(
             z_dim=z_dim,
             action_embedding_dim=action_embedding_dim,
             n_teacher_actions=n_teacher_actions,
             n_student_types=n_student_types,
-            hidden_dim=hidden_dim,
+            hidden_dim=teacher_hidden_dim,
         )
         self.voi_critic_head = VoICriticHead(
             n_student_types=n_student_types,
             n_teacher_actions=n_teacher_actions,
             state_dim=state_dim,
-            hidden_dim=hidden_dim, 
+            hidden_dim=teacher_hidden_dim, 
         )
 
     def forward(self, zq, prev_teacher_action, s_t):
